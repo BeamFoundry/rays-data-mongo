@@ -251,7 +251,9 @@ type DescEntity struct {
 }
 
 type DescRepo struct {
+	FindByNameOrderByDescription           func(string) []DescEntity
 	FindByNameOrderByDescriptionAsc        func(string) []DescEntity
+	FindByNameOrderByDescriptionDesc       func(string) []DescEntity
 	FindByDescriptionOrderByDescription    func(string) []DescEntity
 	FindByNameOrderByAgeDescriptionAsc     func(string) []DescEntity
 	FindByNameOrderByAgeDescDescriptionAsc func(string) []DescEntity
@@ -273,9 +275,11 @@ type AscFieldEntity struct {
 }
 
 type AscFieldRepo struct {
-	FindByNameOrderByAscCodeAsc    func(string) []AscFieldEntity
-	FindByNameOrderByAscCode       func(string) []AscFieldEntity
-	FindByNameOrderByAgeAscCodeAsc func(string) []AscFieldEntity
+	FindByNameOrderByAscCode           func(string) []AscFieldEntity
+	FindByNameOrderByAscCodeAsc        func(string) []AscFieldEntity
+	FindByNameOrderByAscCodeDesc       func(string) []AscFieldEntity
+	FindByNameOrderByAgeAscCodeAsc     func(string) []AscFieldEntity
+	FindByNameOrderByAgeDescAscCodeAsc func(string) []AscFieldEntity
 	MongoRepository[AscFieldEntity, primitive.ObjectID]
 }
 
@@ -1615,6 +1619,18 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			var nilStrPtr *string
 			Expect(ExportCopyFilter(nilStrPtr)).To(BeNil())
 
+			ptrShared := "shared_val"
+			qShared := userRepo.Query().Where(bson.M{"a": &ptrShared, "b": &ptrShared})
+			filterShared, ok := qShared.Filter().(bson.M)
+			Expect(ok).To(BeTrue())
+			pA, ok := filterShared["a"].(*string)
+			Expect(ok).To(BeTrue())
+			pB, ok := filterShared["b"].(*string)
+			Expect(ok).To(BeTrue())
+			Expect(pA).To(BeIdenticalTo(pB))
+			Expect(pA).NotTo(BeIdenticalTo(&ptrShared))
+			Expect(*pA).To(Equal("shared_val"))
+
 			// 16. Normalize typed nil top-level bson.D filters to empty documents in Where and Or
 			var nilD bson.D
 			qWhereNilD := userRepo.Query().Where(nilD)
@@ -1685,39 +1701,134 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(inlineMapRepo.Delete(inlineNoIDDoc)).To(HaveOccurred())
 
 			// 19. Sort parsing fallback to implicit direction and compound ordering
-			descDoc := &DescEntity{Name: "item1", Description: "desc1", Age: 30}
-			_, err = descRepo.Save(descDoc)
+			descDocs := []*DescEntity{
+				{Name: "item1", Description: "descB", Age: 20},
+				{Name: "item1", Description: "descC", Age: 10},
+				{Name: "item1", Description: "descA", Age: 20},
+				{Name: "item1", Description: "descD", Age: 30},
+			}
+			savedDescDocs, err := descRepo.SaveAll(descDocs)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(savedDescDocs).To(HaveLen(4))
 
-			foundDescs := descRepo.FindByNameOrderByDescriptionAsc("item1")
-			Expect(foundDescs).To(HaveLen(1))
-			Expect(foundDescs[0].Description).To(Equal("desc1"))
+			// Implicit ascending
+			foundDescsImplicit := descRepo.FindByNameOrderByDescription("item1")
+			Expect(foundDescsImplicit).To(HaveLen(4))
+			Expect(foundDescsImplicit[0].Description).To(Equal("descA"))
+			Expect(foundDescsImplicit[1].Description).To(Equal("descB"))
+			Expect(foundDescsImplicit[2].Description).To(Equal("descC"))
+			Expect(foundDescsImplicit[3].Description).To(Equal("descD"))
 
-			foundDescs2 := descRepo.FindByDescriptionOrderByDescription("desc1")
-			Expect(foundDescs2).To(HaveLen(1))
+			// Explicit ascending
+			foundDescsAsc := descRepo.FindByNameOrderByDescriptionAsc("item1")
+			Expect(foundDescsAsc).To(HaveLen(4))
+			Expect(foundDescsAsc[0].Description).To(Equal("descA"))
+			Expect(foundDescsAsc[1].Description).To(Equal("descB"))
+			Expect(foundDescsAsc[2].Description).To(Equal("descC"))
+			Expect(foundDescsAsc[3].Description).To(Equal("descD"))
 
+			// Descending
+			foundDescsDesc := descRepo.FindByNameOrderByDescriptionDesc("item1")
+			Expect(foundDescsDesc).To(HaveLen(4))
+			Expect(foundDescsDesc[0].Description).To(Equal("descD"))
+			Expect(foundDescsDesc[1].Description).To(Equal("descC"))
+			Expect(foundDescsDesc[2].Description).To(Equal("descB"))
+			Expect(foundDescsDesc[3].Description).To(Equal("descA"))
+
+			foundDescsFallback := descRepo.FindByDescriptionOrderByDescription("descB")
+			Expect(foundDescsFallback).To(HaveLen(1))
+			Expect(foundDescsFallback[0].Description).To(Equal("descB"))
+
+			// Compound ordering: implicit ascending age, explicit ascending description (tied age 20)
 			foundDescs3 := descRepo.FindByNameOrderByAgeDescriptionAsc("item1")
-			Expect(foundDescs3).To(HaveLen(1))
+			Expect(foundDescs3).To(HaveLen(4))
+			Expect(foundDescs3[0].Age).To(Equal(10))
+			Expect(foundDescs3[0].Description).To(Equal("descC"))
+			Expect(foundDescs3[1].Age).To(Equal(20))
+			Expect(foundDescs3[1].Description).To(Equal("descA"))
+			Expect(foundDescs3[2].Age).To(Equal(20))
+			Expect(foundDescs3[2].Description).To(Equal("descB"))
+			Expect(foundDescs3[3].Age).To(Equal(30))
+			Expect(foundDescs3[3].Description).To(Equal("descD"))
 
+			// Compound ordering: explicit descending age, explicit ascending description (tied age 20)
 			foundDescs4 := descRepo.FindByNameOrderByAgeDescDescriptionAsc("item1")
-			Expect(foundDescs4).To(HaveLen(1))
-			Expect(descRepo.Delete(descDoc)).NotTo(HaveOccurred())
+			Expect(foundDescs4).To(HaveLen(4))
+			Expect(foundDescs4[0].Age).To(Equal(30))
+			Expect(foundDescs4[0].Description).To(Equal("descD"))
+			Expect(foundDescs4[1].Age).To(Equal(20))
+			Expect(foundDescs4[1].Description).To(Equal("descA"))
+			Expect(foundDescs4[2].Age).To(Equal(20))
+			Expect(foundDescs4[2].Description).To(Equal("descB"))
+			Expect(foundDescs4[3].Age).To(Equal(10))
+			Expect(foundDescs4[3].Description).To(Equal("descC"))
+
+			for _, d := range savedDescDocs {
+				Expect(descRepo.Delete(d)).NotTo(HaveOccurred())
+			}
 
 			// Sort parsing fallback with Asc-prefixed field names
-			ascDoc := &AscFieldEntity{Name: "itemAsc", AscCode: "code1", Age: 25}
-			_, err = ascFieldRepo.Save(ascDoc)
+			ascDocs := []*AscFieldEntity{
+				{Name: "itemAsc", AscCode: "codeB", Age: 20},
+				{Name: "itemAsc", AscCode: "codeC", Age: 10},
+				{Name: "itemAsc", AscCode: "codeA", Age: 20},
+				{Name: "itemAsc", AscCode: "codeD", Age: 30},
+			}
+			savedAscDocs, err := ascFieldRepo.SaveAll(ascDocs)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(savedAscDocs).To(HaveLen(4))
 
-			foundAscs := ascFieldRepo.FindByNameOrderByAscCodeAsc("itemAsc")
-			Expect(foundAscs).To(HaveLen(1))
-			Expect(foundAscs[0].AscCode).To(Equal("code1"))
+			// Implicit ascending
+			foundAscsImplicit := ascFieldRepo.FindByNameOrderByAscCode("itemAsc")
+			Expect(foundAscsImplicit).To(HaveLen(4))
+			Expect(foundAscsImplicit[0].AscCode).To(Equal("codeA"))
+			Expect(foundAscsImplicit[1].AscCode).To(Equal("codeB"))
+			Expect(foundAscsImplicit[2].AscCode).To(Equal("codeC"))
+			Expect(foundAscsImplicit[3].AscCode).To(Equal("codeD"))
 
-			foundAscs2 := ascFieldRepo.FindByNameOrderByAscCode("itemAsc")
-			Expect(foundAscs2).To(HaveLen(1))
+			// Explicit ascending
+			foundAscsAsc := ascFieldRepo.FindByNameOrderByAscCodeAsc("itemAsc")
+			Expect(foundAscsAsc).To(HaveLen(4))
+			Expect(foundAscsAsc[0].AscCode).To(Equal("codeA"))
+			Expect(foundAscsAsc[1].AscCode).To(Equal("codeB"))
+			Expect(foundAscsAsc[2].AscCode).To(Equal("codeC"))
+			Expect(foundAscsAsc[3].AscCode).To(Equal("codeD"))
 
+			// Descending
+			foundAscsDesc := ascFieldRepo.FindByNameOrderByAscCodeDesc("itemAsc")
+			Expect(foundAscsDesc).To(HaveLen(4))
+			Expect(foundAscsDesc[0].AscCode).To(Equal("codeD"))
+			Expect(foundAscsDesc[1].AscCode).To(Equal("codeC"))
+			Expect(foundAscsDesc[2].AscCode).To(Equal("codeB"))
+			Expect(foundAscsDesc[3].AscCode).To(Equal("codeA"))
+
+			// Compound ordering: implicit ascending age, explicit ascending asc_code (tied age 20)
 			foundAscs3 := ascFieldRepo.FindByNameOrderByAgeAscCodeAsc("itemAsc")
-			Expect(foundAscs3).To(HaveLen(1))
-			Expect(ascFieldRepo.Delete(ascDoc)).NotTo(HaveOccurred())
+			Expect(foundAscs3).To(HaveLen(4))
+			Expect(foundAscs3[0].Age).To(Equal(10))
+			Expect(foundAscs3[0].AscCode).To(Equal("codeC"))
+			Expect(foundAscs3[1].Age).To(Equal(20))
+			Expect(foundAscs3[1].AscCode).To(Equal("codeA"))
+			Expect(foundAscs3[2].Age).To(Equal(20))
+			Expect(foundAscs3[2].AscCode).To(Equal("codeB"))
+			Expect(foundAscs3[3].Age).To(Equal(30))
+			Expect(foundAscs3[3].AscCode).To(Equal("codeD"))
+
+			// Compound ordering: explicit descending age, explicit ascending asc_code (tied age 20)
+			foundAscs4 := ascFieldRepo.FindByNameOrderByAgeDescAscCodeAsc("itemAsc")
+			Expect(foundAscs4).To(HaveLen(4))
+			Expect(foundAscs4[0].Age).To(Equal(30))
+			Expect(foundAscs4[0].AscCode).To(Equal("codeD"))
+			Expect(foundAscs4[1].Age).To(Equal(20))
+			Expect(foundAscs4[1].AscCode).To(Equal("codeA"))
+			Expect(foundAscs4[2].Age).To(Equal(20))
+			Expect(foundAscs4[2].AscCode).To(Equal("codeB"))
+			Expect(foundAscs4[3].Age).To(Equal(10))
+			Expect(foundAscs4[3].AscCode).To(Equal("codeC"))
+
+			for _, d := range savedAscDocs {
+				Expect(ascFieldRepo.Delete(d)).NotTo(HaveOccurred())
+			}
 
 			// Cyclic custom BSON-marshaler reaches driver's marshaler path without unbounded copying
 			cyclicMap := cyclicMapMarshaler{"val": "cyclic_val"}
@@ -1726,8 +1837,11 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(qCyclic.Filter()).NotTo(BeNil())
 			var cyclicFindResult []User
 			Expect(qCyclic.Find(&cyclicFindResult)).NotTo(HaveOccurred())
-			copiedCyclic := ExportCopyFilter(&cyclicMap)
+			copiedCyclic, ok := ExportCopyFilter(&cyclicMap).(*cyclicMapMarshaler)
+			Expect(ok).To(BeTrue())
 			Expect(copiedCyclic).NotTo(BeNil())
+			Expect(copiedCyclic).NotTo(BeIdenticalTo(&cyclicMap))
+			Expect((*copiedCyclic)["self"]).To(BeIdenticalTo(copiedCyclic))
 
 			// 20. marshalWithCollection with nil collection, empty collection without registry/opts, and custom collection with BSONOptions & registry
 			nilCollBytes, mErr := ExportMarshalWithCollection(nil, bson.M{"a": 1})

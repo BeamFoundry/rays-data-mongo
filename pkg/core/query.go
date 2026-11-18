@@ -837,10 +837,10 @@ func convertDistinctValue(val any, targetType reflect.Type) (reflect.Value, Erro
 }
 
 func copyFilter(val any) any {
-	return copyFilterWithVisited(val, make(map[uintptr]bool))
+	return copyFilterWithVisited(val, make(map[uintptr]any))
 }
 
-func copyFilterWithVisited(val any, visited map[uintptr]bool) any {
+func copyFilterWithVisited(val any, visited map[uintptr]any) any {
 	if val == nil {
 		return nil
 	}
@@ -943,11 +943,11 @@ func copyFilterWithVisited(val any, visited map[uintptr]bool) any {
 				return val
 			}
 			ptr := rv.Pointer()
-			if visited[ptr] {
-				return val
+			if existing, ok := visited[ptr]; ok {
+				return existing
 			}
-			visited[ptr] = true
 			newPtr := reflect.New(rv.Type().Elem())
+			visited[ptr] = newPtr.Interface()
 			copiedElem := copyFilterWithVisited(rv.Elem().Interface(), visited)
 			if copiedElem != nil {
 				newPtr.Elem().Set(reflect.ValueOf(copiedElem))
