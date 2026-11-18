@@ -836,11 +836,16 @@ func convertDistinctValue(val any, targetType reflect.Type) (reflect.Value, Erro
 	return out, nil
 }
 
-func copyFilter(val any) any {
-	return copyFilterWithVisited(val, make(map[uintptr]any))
+type visitedPointerKey struct {
+	typ  reflect.Type
+	addr uintptr
 }
 
-func copyFilterWithVisited(val any, visited map[uintptr]any) any {
+func copyFilter(val any) any {
+	return copyFilterWithVisited(val, make(map[visitedPointerKey]any))
+}
+
+func copyFilterWithVisited(val any, visited map[visitedPointerKey]any) any {
 	if val == nil {
 		return nil
 	}
@@ -942,12 +947,15 @@ func copyFilterWithVisited(val any, visited map[uintptr]any) any {
 			if rv.IsNil() {
 				return val
 			}
-			ptr := rv.Pointer()
-			if existing, ok := visited[ptr]; ok {
+			key := visitedPointerKey{
+				addr: rv.Pointer(),
+				typ:  rv.Type(),
+			}
+			if existing, ok := visited[key]; ok {
 				return existing
 			}
 			newPtr := reflect.New(rv.Type().Elem())
-			visited[ptr] = newPtr.Interface()
+			visited[key] = newPtr.Interface()
 			copiedElem := copyFilterWithVisited(rv.Elem().Interface(), visited)
 			if copiedElem != nil {
 				newPtr.Elem().Set(reflect.ValueOf(copiedElem))

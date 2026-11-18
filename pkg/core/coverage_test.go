@@ -1631,6 +1631,18 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(pA).NotTo(BeIdenticalTo(&ptrShared))
 			Expect(*pA).To(Equal("shared_val"))
 
+			// Pointers of different types at the same address (zero-sized allocations) do not reuse incompatible copies
+			type zeroTypeA struct{}
+			type zeroTypeB struct{}
+			pZA := new(zeroTypeA)
+			pZB := new(zeroTypeB)
+			Expect(reflect.ValueOf(pZA).Pointer()).To(Equal(reflect.ValueOf(pZB).Pointer()))
+			diffTypeFilter := bson.M{"a": pZA, "b": pZB}
+			copiedDiff, ok := ExportCopyFilter(diffTypeFilter).(bson.M)
+			Expect(ok).To(BeTrue())
+			Expect(copiedDiff["a"]).To(BeAssignableToTypeOf(pZA))
+			Expect(copiedDiff["b"]).To(BeAssignableToTypeOf(pZB))
+
 			// 16. Normalize typed nil top-level bson.D filters to empty documents in Where and Or
 			var nilD bson.D
 			qWhereNilD := userRepo.Query().Where(nilD)
