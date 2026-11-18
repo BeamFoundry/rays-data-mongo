@@ -50,7 +50,7 @@ the field name and binds a compiled BSON query implementation to it.
 1. **Prefix:**
    * `find` / `Find` / `query` / `Query`: single entity (`*T`, `Optional[*T]`), slice (`[]T`), `Stream[T]`, or `*MongoQuery`.
    * `list` / `List`: multiple entities (`[]T`).
-   * `stream` / `Stream`: lazy `Stream[T]`.
+   * `stream` / `Stream`: `Stream[T]` (buffers matching documents into memory via `Find` before stream creation).
    * `count` / `Count`: returns `int64` or `(int64, Error)`.
    * `exists` / `Exists`: returns `bool` or `(bool, Error)`.
    * `delete` / `Delete`: deletes matching documents and returns `Error`, `int64`, or `(int64, Error)`.
@@ -90,7 +90,7 @@ the field name and binds a compiled BSON query implementation to it.
 ### Return Types
 
 * **Single Entity:** `*T` or `Optional[*T]`
-* **Multiple Entities:** `[]T` or `Stream[T]`
+* **Multiple Entities:** `[]T` or `Stream[T]` (Note: `Stream[T]` buffers all matching documents into memory via `Find` before returning the stream for functional pipeline transformations).
 * **Aggregates / Existence:** `int64` (`CountBy...`, `DeleteBy...`), `bool` (`ExistsBy...`)
 * **Query Builder:** `*MongoQuery` (returns the compiled query prior to execution)
 * **Error Handling:** Append `Error` as a second return value (or sole return value for `DeleteBy...`).
@@ -125,6 +125,7 @@ type UserRepositoryInterface interface {
     MongoRepositoryInterface[User, primitive.ObjectID]
 
     FindByName(name string) Optional[*User]
+    ListByAddressCity(city string, filters ...MongoQueryFunc) ([]User, Error)
     ListActiveInCity(city string, filters ...MongoQueryFunc) ([]User, Error)
     StreamByAgeGreaterThan(minAge uint) (Stream[User], Error)
     CountByStatus(status string) (int64, Error)
@@ -133,18 +134,23 @@ type UserRepositoryInterface interface {
 type UserRepository struct {
     MongoRepository[User, primitive.ObjectID]
 
-    findByName             func(string) Optional[*User]
-    listByAddressCity      func(string, ...MongoQueryFunc) ([]User, Error)
-    streamByAgeGreaterThan func(uint) (Stream[User], Error)
-    countByStatus          func(string) (int64, Error)
+    findByName                       func(string) Optional[*User]
+    listByAddressCity                func(string, ...MongoQueryFunc) ([]User, Error)
+    listByAddressCityAndActiveIsTrue func(string, ...MongoQueryFunc) ([]User, Error)
+    streamByAgeGreaterThan          func(uint) (Stream[User], Error)
+    countByStatus                   func(string) (int64, Error)
 }
 
 func (r *UserRepository) FindByName(name string) Optional[*User] {
     return r.findByName(name)
 }
 
-func (r *UserRepository) ListActiveInCity(city string, filters ...MongoQueryFunc) ([]User, Error) {
+func (r *UserRepository) ListByAddressCity(city string, filters ...MongoQueryFunc) ([]User, Error) {
     return r.listByAddressCity(city, filters...)
+}
+
+func (r *UserRepository) ListActiveInCity(city string, filters ...MongoQueryFunc) ([]User, Error) {
+    return r.listByAddressCityAndActiveIsTrue(city, filters...)
 }
 
 func (r *UserRepository) StreamByAgeGreaterThan(minAge uint) (Stream[User], Error) {

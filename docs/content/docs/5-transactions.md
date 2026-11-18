@@ -26,7 +26,6 @@ package services
 import (
     "context"
 
-    . "github.com/BeamFoundry/rays-data-mongo/pkg/core"
     . "github.com/BeamFoundry/rays-data-mongo/pkg/tx"
     . "github.com/BeamFoundry/rays/pkg/core"
     . "github.com/BeamFoundry/rays/pkg/lang"
@@ -54,6 +53,25 @@ func (s *OrderService) UpdateUserWithAudit(ctx context.Context, user *User) {
         return nil // Triggers Commit
     })
 }
+```
+
+> **Note:** `Transactional` does not return callback or commit failures to its caller; any error is logged and triggers a rollback. Callers needing the transaction result or explicit error propagation can use `Execute`, `ExecuteWithResult`, or the manual transaction lifecycle.
+
+## Result-Bearing Transactions (`Execute` and `ExecuteWithResult`)
+
+While `Transactional` conforms to the standard Rays `Transactional[T]` contract, `MongoTransactionalManager` also provides `Execute` and `ExecuteWithResult` so callers can receive results and distinguish errors:
+
+```go
+// Execute returns any startup, callback, or commit error:
+err := s.txManager.Execute(ctx, func(sess *MongoSession) Error {
+    _, err := s.userRepo.Save(user)
+    return err
+})
+
+// ExecuteWithResult returns computed results and propagates errors:
+savedUser, err := ExecuteWithResult(ctx, s.txManager, func(sess *MongoSession) (*User, Error) {
+    return s.userRepo.Save(user)
+})
 ```
 
 ## Manual Transaction Management

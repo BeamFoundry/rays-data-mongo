@@ -2,7 +2,6 @@ package autoconfig
 
 import (
 	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 
 	. "github.com/BeamFoundry/rays-data-mongo/pkg/tx"
 	. "github.com/BeamFoundry/rays-data-mongo/pkg/util"
@@ -24,8 +23,8 @@ func (this *MongoAutoConfig) MongoLogSink(
 	_ struct {
 		ConditionalOnMissingBeam
 	},
-) options.LogSink {
-	return MongoLogSink{}.New()
+) *MongoLogSink {
+	return MongoLogSink{}.New().WithLogger(this.logger)
 }
 
 // MongoTxManager provides the default [MongoTransactional] Beam backed by [MongoTransactionalManager].
@@ -36,11 +35,11 @@ func (this *MongoAutoConfig) MongoTxManager(
 		database Optional[*mongo.Database] `@:"Inject"`
 	},
 ) (MongoTransactional, Error) {
-	if c, ok := that.client.Get(); ok && c != nil {
-		return NewMongoTransactionalManager(c, this.logger), nil
-	}
 	if db, ok := that.database.Get(); ok && db != nil {
 		return NewMongoTransactionalManager(db.Client(), this.logger), nil
+	}
+	if c, ok := that.client.Get(); ok && c != nil {
+		return NewMongoTransactionalManager(c, this.logger), nil
 	}
 	return nil, NewError("MongoConfigurationError", "No *mongo.Client or *mongo.Database Beam available to configure MongoTransactional")
 }

@@ -3,6 +3,7 @@ package core_test
 import (
 	"context"
 	"fmt"
+	"runtime/pprof"
 	"testing"
 	"time"
 
@@ -267,17 +268,52 @@ type UserService struct {
 }
 
 func (this *UserService) TransactionalChangeRollback(userID primitive.ObjectID) {
+	var writeCompleted bool
+	var originalName string
 	this.transactionManager.Transactional(context.Background(), func(_ *MongoSession) Error {
 		user, ok := this.userRepository.FindById(userID).Get()
 		Expect(ok).To(BeTrue())
+		originalName = user.Name
 		user.Name = "bar"
 		_, err := this.userRepository.Save(user)
 		Expect(err).NotTo(HaveOccurred())
+		writeCompleted = true
 		return NewError("TransactionalError", "Rolling back")
 	})
 
+	Expect(writeCompleted).To(BeTrue())
 	u := this.userRepository.FindByName("bar")
 	Expect(u).To(BeNil())
+	original, ok := this.userRepository.FindById(userID).Get()
+	Expect(ok).To(BeTrue())
+	Expect(original.Name).To(Equal(originalName))
+}
+
+func (this *UserService) TransactionalChangeRollbackPprof(userID primitive.ObjectID) {
+	ctx := context.Background()
+	labels := pprof.Labels("worker", "tx-pprof-test")
+	writeCompleted := false
+	var originalName string
+
+	this.transactionManager.Transactional(ctx, func(_ *MongoSession) Error {
+		pprof.Do(ctx, labels, func(_ context.Context) {
+			user, ok := this.userRepository.FindById(userID).Get()
+			Expect(ok).To(BeTrue())
+			originalName = user.Name
+			user.Name = "bar-pprof"
+			_, err := this.userRepository.Save(user)
+			Expect(err).NotTo(HaveOccurred())
+			writeCompleted = true
+		})
+		return NewError("TransactionalError", "Rolling back inside pprof")
+	})
+
+	Expect(writeCompleted).To(BeTrue())
+	u := this.userRepository.FindByName("bar-pprof")
+	Expect(u).To(BeNil())
+	original, ok := this.userRepository.FindById(userID).Get()
+	Expect(ok).To(BeTrue())
+	Expect(original.Name).To(Equal(originalName))
 }
 
 func (this *UserService) TransactionalChangeCommit(userID primitive.ObjectID) {
@@ -324,7 +360,7 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 		var err error
 		mongodbContainer, err = container.Run(
 			ctx,
-			"mongo:latest",
+			"mongo:8.2.7",
 			container.WithReplicaSet("rs0"),
 			testcontainers.WithLogger(GetLogger()),
 		)
@@ -635,6 +671,7 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 
 		It("supports ThreadLocal transactions with commit, rollback, and manual error after rollback", func() {
 			userService.TransactionalChangeRollback(dorothy.ID)
+			userService.TransactionalChangeRollbackPprof(dorothy.ID)
 			userService.TransactionalChangeCommit(dorothy.ID)
 			userService.ErrorAfterRollback(dorothy.ID)
 		})

@@ -198,15 +198,18 @@ func (this *mongoQueryBuilder[T, ID]) parseWhereQuery(s string) (*whereQuery, st
 	case String(s).StartsWith("Or"):
 		s = s[2:]
 		w.mode = whereModes.OR
-	default:
-		// Subsequent segments after the first condition always start with "And"
+	case String(s).StartsWith("And"):
 		s = s[3:]
+	default:
+		return nil, "", NewError("IllegalArgumentError", "Condition segment must start with 'By', 'And', or 'Or'")
 	}
 
+	hadFieldMatch := false
 	for _, field := range this.fields {
 		if !String(s).StartsWith(field.camelName) {
 			continue
 		}
+		hadFieldMatch = true
 		rest := s[len(field.camelName):]
 		w.field = field
 		if rest == "" || String(rest).StartsWith("And") || String(rest).StartsWith("Or") {
@@ -222,6 +225,9 @@ func (this *mongoQueryBuilder[T, ID]) parseWhereQuery(s string) (*whereQuery, st
 				return w, rest, nil
 			}
 		}
+		// Suffix did not form a valid condition for this field; continue trying shorter field matches.
+	}
+	if hadFieldMatch {
 		return nil, "", NewError("IllegalArgumentError", "Invalid operator")
 	}
 	return nil, "", NewError("IllegalArgumentError", "Could not match a valid T field for condition")
@@ -257,10 +263,35 @@ func (this *mongoQueryBuilder[T, ID]) Build(function *reflect.StructField) (*mon
 	conditionStr := predicateStr
 	orderStr := ""
 
-	orderByIndex := Strings(predicateStr).LastIndex("OrderBy")
-	if orderByIndex != -1 {
-		conditionStr = predicateStr[:orderByIndex]
-		orderStr = predicateStr[orderByIndex+7:]
+	// Check if a string can be completely resolved into valid condition tokens without OrderBy
+	canParseAsConditions := func(str string) bool {
+		s := str
+		for s != "" {
+			_, rest, err := this.parseWhereQuery(s)
+			if err != nil {
+				return false
+			}
+			s = rest
+		}
+		return true
+	}
+
+	if !canParseAsConditions(predicateStr) {
+		curr := predicateStr
+		for {
+			idx := Strings(curr).LastIndex("OrderBy")
+			if idx == -1 {
+				break
+			}
+			candCond := predicateStr[:idx]
+			candOrder := predicateStr[idx+7:]
+			if canParseAsConditions(candCond) && candOrder != "" {
+				conditionStr = candCond
+				orderStr = candOrder
+				break
+			}
+			curr = predicateStr[:idx]
+		}
 	}
 
 	query := &mongoCompiledQuery[T, ID]{
@@ -512,6 +543,8 @@ func (this *mongoCompiledQuery[T, ID]) executeFind(
 		err := q.Find(&t)
 		return reflect.ValueOf(t), err
 	case stream:
+		// Stream query methods buffer all matching results via q.Find before
+		// constructing the Stream via Stream[T]{}.FromSlice(t).
 		var t []T
 		err := q.Find(&t)
 		s := Stream[T]{}.FromSlice(t)

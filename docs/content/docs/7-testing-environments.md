@@ -138,5 +138,28 @@ var _ = Describe("UserRepository", Ordered, func() {
             Expect(client.Disconnect(context.Background())).NotTo(HaveOccurred())
         }
     })
+
+    It("writes and reads documents with transactional rollback isolation", func() {
+        repo := GetBeamScopedInstance[*UserRepository]()
+        txMgr := GetBeamScopedInstance[MongoTransactional]()
+
+        // Standard write and read against the replica set
+        saved, err := repo.Save(&User{Name: "Alice", Age: 30})
+        Expect(err).NotTo(HaveOccurred())
+
+        found := repo.FindById(saved.ID)
+        Expect(found.IsPresent()).To(BeTrue())
+        user, _ := found.Get()
+        Expect(user.Name).To(Equal("Alice"))
+
+        // Document saved in a rolled-back transaction is not visible outside
+        txMgr.Transactional(context.Background(), func(_ *MongoSession) Error {
+            _, saveErr := repo.Save(&User{Name: "Bob", Age: 25})
+            Expect(saveErr).NotTo(HaveOccurred())
+            return NewError("RollbackError", "abort transaction")
+        })
+
+        Expect(repo.FindByName("Bob")).To(BeNil())
+    })
 })
 ```

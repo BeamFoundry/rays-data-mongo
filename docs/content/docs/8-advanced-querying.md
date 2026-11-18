@@ -54,14 +54,18 @@ users, err := userRepo.ListByAddressCity("Emerald City", ActiveRecentUsers(1))
 ## 3. Aggregations, Distinct, and Raw Collection Access
 
 Every repository embedding `MongoRepository` exposes `Query(queries ...MongoQueryFunc) *MongoQuery` and
-`Collection() *mongo.Collection`, both bound to any active ThreadLocal transaction:
+`Collection() *mongo.Collection`. While `Query()` automatically uses the active ThreadLocal transaction context,
+`Collection()` returns an unbound `*mongo.Collection`; raw driver operations executed directly against `Collection()`
+must receive the active session context explicitly to participate in the transaction:
 
 ```go
 // Distinct values
 var ages []uint
 err := userRepo.Query(WithWhere(bson.M{"active": true})).
-    OrderByAsc("age").
     Distinct("age", &ages)
+if err == nil {
+    slices.Sort(ages) // Sort in Go if ascending order is needed; MongoDB distinct results are unordered
+}
 
 // Aggregation pipeline
 type RoleStats struct {

@@ -106,6 +106,8 @@ import (
 
     "github.com/BeamFoundry/rays"
     _ "github.com/BeamFoundry/rays-data-mongo"
+    _ "myapp/config"
+    _ "myapp/repositories"
 )
 
 func main() {

@@ -16,8 +16,9 @@ clean:
 
 .PHONY: test
 test: fmt
+	# Requires golangci-lint v2.0.0+ (tested with v2.15.0+)
 	golangci-lint run ./...
-	ginkgo run -cover ./...
+	go run github.com/onsi/ginkgo/v2/ginkgo run -cover ./...
 
 .PHONY: validate
 validate: fix test

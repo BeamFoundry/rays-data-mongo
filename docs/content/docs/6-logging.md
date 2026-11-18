@@ -42,6 +42,18 @@ func (c *MongoConfig) Client() (*mongo.Client, Error) {
 var _, _ = any(&MongoConfig{}).(Stereotype)
 ```
 
+By default, command payload logging is disabled to protect sensitive application data. To opt into logging command bodies at debug level:
+
+```go
+func (c *MongoConfig) Client() (*mongo.Client, Error) {
+    return NewMongoClientBuilder().
+        WithURI("mongodb://localhost:27017").
+        WithLogSink(c.logSink).
+        WithCommandLogging(true).
+        Build()
+}
+```
+
 ## Bridging Custom `*mongo.Client` Beams Directly
 
 If you construct `*options.ClientOptions` manually, inject `options.LogSink` (or register `MongoLogSink{}.New()` from `pkg/util` as a Beam) and pass it to `options.Logger()`:

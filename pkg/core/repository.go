@@ -176,6 +176,7 @@ func (this *MongoRepository[T, K]) ExistsById(id K) (bool, Error) {
 }
 
 // Delete removes the given entity document by its _id field.
+// If no _id-mapped field exists, entity-based deletion is rejected and callers must use DeleteById with the actual key.
 func (this *MongoRepository[T, K]) Delete(object *T) Error {
 	if object == nil {
 		return NewError("IllegalArgumentError", "Cannot delete nil entity")
@@ -184,9 +185,9 @@ func (this *MongoRepository[T, K]) Delete(object *T) Error {
 	if err != nil {
 		return err
 	}
-	idVal, hasID := extractEntityID(object)
-	if !hasID || isZeroValue(idVal) {
-		return NewError("IllegalArgumentError", "Entity does not have a non-zero _id field")
+	_, idVal, hasEncodedID := entityIDStatus(object)
+	if !hasEncodedID {
+		return NewError("IllegalArgumentError", "Entity does not have a non-zero _id field; use DeleteById with the actual key")
 	}
 	if _, driverErr := this.Collection().DeleteOne(ctx, bson.M{bsonIDField: idVal}); driverErr != nil {
 		return NewWrappedError("MongoError", driverErr)
@@ -218,15 +219,17 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	}
 
 	coll := this.Collection()
-	idField, idVal := prepareEntityIDForSave(object)
+	idField, idVal, hasEncodedID := entityIDStatus(object)
 
-	if idVal != nil && !isZeroValue(idVal) {
+	if hasEncodedID {
 		opts := options.Replace().SetUpsert(true)
 		if _, driverErr := coll.ReplaceOne(ctx, bson.M{bsonIDField: idVal}, object, opts); driverErr != nil {
 			return nil, NewWrappedError("MongoError", driverErr)
 		}
 		return object, nil
 	}
+
+	_ = assignGeneratedID(idField)
 
 	res, driverErr := coll.InsertOne(ctx, object)
 	if driverErr != nil {
@@ -256,13 +259,16 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 		if object == nil {
 			return nil, NewError("IllegalArgumentError", "Cannot save nil entity in SaveAll")
 		}
-		_, idVal := prepareEntityIDForSave(object)
-		if idVal != nil && !isZeroValue(idVal) {
+		idField, idVal, hasEncodedID := entityIDStatus(object)
+		if hasEncodedID {
 			models = append(models, mongo.NewReplaceOneModel().
 				SetFilter(bson.M{bsonIDField: idVal}).
 				SetReplacement(object).
 				SetUpsert(true))
 		} else {
+			if !assignGeneratedID(idField) {
+				return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in SaveAll")
+			}
 			models = append(models, mongo.NewInsertOneModel().SetDocument(object))
 		}
 	}
@@ -278,10 +284,14 @@ func (this *MongoRepository[T, K]) EnsureIndexes(ctx context.Context, models ...
 	if len(models) == 0 {
 		return nil, nil
 	}
-	//nolint:contextcheck // Fallback to active repository session context when nil
+	activeCtx, sessErr := this.validateActiveSession()
+	if sessErr != nil {
+		return nil, sessErr
+	}
+	//nolint:contextcheck // Fallback to active repository session context when caller passes nil
 	execCtx := ctx
 	if execCtx == nil {
-		execCtx = this.activeContext()
+		execCtx = activeCtx
 	}
 	names, err := this.Collection().Indexes().CreateMany(execCtx, models)
 	if err != nil {
@@ -332,6 +342,9 @@ func findIDField(v reflect.Value) reflect.Value {
 	// Prefer explicit bson:"_id" tag
 	for i := range t.NumField() {
 		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
 		bsonName, inline, skip := parseBSONTag(&field)
 		if skip {
 			continue
@@ -346,37 +359,51 @@ func findIDField(v reflect.Value) reflect.Value {
 			return v.Field(i)
 		}
 	}
-	// Fallback to field named ID
-	if f := v.FieldByName("ID"); f.IsValid() {
-		return f
-	}
+	// Untagged "ID" fields are intentionally not selected as identity because the MongoDB driver
+	// only serializes fields to "_id" if explicitly tagged with bson:"_id".
 	return reflect.Value{}
 }
 
-func extractEntityID(object any) (any, bool) {
-	field := findIDField(reflect.ValueOf(object))
-	if !field.IsValid() {
-		return nil, false
+func entityIDStatus(object any) (idField reflect.Value, idVal any, hasEncodedID bool) {
+	if object == nil {
+		return reflect.Value{}, nil, false
 	}
-	return field.Interface(), true
-}
-
-func prepareEntityIDForSave(object any) (idField reflect.Value, idVal any) {
 	idField = findIDField(reflect.ValueOf(object))
 	if !idField.IsValid() {
-		return reflect.Value{}, nil
+		return reflect.Value{}, nil, false
 	}
-	if idField.Type() == objectIDType && idField.IsZero() && idField.CanSet() {
-		newID := primitive.NewObjectID()
-		idField.Set(reflect.ValueOf(newID))
-		return idField, newID
+
+	rawBytes, err := bson.Marshal(object)
+	if err != nil {
+		return idField, nil, false
 	}
-	return idField, idField.Interface()
+	rawVal, err := bson.Raw(rawBytes).LookupErr(bsonIDField)
+	if err != nil {
+		return idField, nil, false
+	}
+
+	if rawVal.Type == bson.TypeObjectID {
+		oid := rawVal.ObjectID()
+		if oid.IsZero() {
+			return idField, nil, false
+		}
+		return idField, oid, true
+	}
+	return idField, idField.Interface(), true
 }
 
-func isZeroValue(val any) bool {
-	if val == nil {
+func assignGeneratedID(idField reflect.Value) bool {
+	if !idField.IsValid() || !idField.CanSet() {
+		return false
+	}
+	if objectIDType.AssignableTo(idField.Type()) {
+		idField.Set(reflect.ValueOf(primitive.NewObjectID()))
 		return true
 	}
-	return reflect.ValueOf(val).IsZero()
+	if reflect.PointerTo(objectIDType).AssignableTo(idField.Type()) {
+		newID := primitive.NewObjectID()
+		idField.Set(reflect.ValueOf(&newID))
+		return true
+	}
+	return false
 }

@@ -99,8 +99,8 @@ var _, _ = any(&UserRepository{}).(Stereotype)
 
 ## 4. The Entrypoint
 
-Underscore-import `github.com/BeamFoundry/rays-data-mongo` in your `main.go` to register `MongoTransactional`
-and activate repository wiring:
+Underscore-import `github.com/BeamFoundry/rays-data-mongo` along with your application packages (`myapp/config`, `myapp/repositories`)
+in your `main.go` so their Beams are registered and repository wiring is activated:
 
 ```go
 package main
@@ -110,6 +110,8 @@ import (
 
     "github.com/BeamFoundry/rays"
     _ "github.com/BeamFoundry/rays-data-mongo"
+    _ "myapp/config"
+    _ "myapp/repositories"
 )
 
 func main() {

@@ -3,6 +3,7 @@ package core_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/testcontainers/testcontainers-go"
@@ -199,6 +200,29 @@ type NoIDRepository struct {
 	MongoRepository[NoIDEntity, string]
 }
 
+type UntaggedIDEntity struct {
+	ID   string
+	Name string
+}
+
+type UntaggedIDRepository struct {
+	MongoRepository[UntaggedIDEntity, string]
+}
+
+type UnexportedFieldEntity struct {
+	unexportedID string `bson:"_id"`
+	Name         string `bson:"name"`
+}
+
+type UnexportedFieldRepo struct {
+	MongoRepository[UnexportedFieldEntity, string]
+}
+
+type LikeRepo struct {
+	findByLabelLike func(string) []RichEntity
+	MongoRepository[RichEntity, string]
+}
+
 type AnonRepository struct {
 	MongoRepository[struct{ Name string }, string]
 }
@@ -210,6 +234,87 @@ type PtrEntityRepository struct {
 type PrimitiveEntityRepository struct {
 	MongoRepository[string, string]
 }
+
+type WorkOrderEntity struct {
+	WorkOrderByName string             `bson:"work_order_by_name"`
+	Status          string             `bson:"status"`
+	Name            string             `bson:"name"`
+	AgeLess         int                `bson:"age_less"`
+	Age             int                `bson:"age"`
+	ID              primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+type WorkOrderRepo struct {
+	findByWorkOrderByName              func(string) *WorkOrderEntity
+	findByStatusOrderByName            func(string) []WorkOrderEntity
+	findByAgeLessThan                  func(int) []WorkOrderEntity
+	findByStatusOrderByWorkOrderByName func(string) []WorkOrderEntity
+	MongoRepository[WorkOrderEntity, primitive.ObjectID]
+}
+
+type IntIDEntity struct {
+	Name string `bson:"name"`
+	ID   int    `bson:"_id"`
+}
+
+type IntIDRepo struct {
+	MongoRepository[IntIDEntity, int]
+}
+
+type PtrIDEntity struct {
+	ID   *primitive.ObjectID `bson:"_id,omitempty"`
+	Name string              `bson:"name"`
+}
+
+type PtrIDRepo struct {
+	MongoRepository[PtrIDEntity, *primitive.ObjectID]
+}
+
+type TestMultiMongoConfig struct {
+	Configuration
+	endpoint *TestMongoEndpoint `@:"Inject"`
+}
+
+func (c *TestMultiMongoConfig) PrimaryClient(
+	_ struct{ Primary },
+) (*mongo.Client, Error) {
+	return NewMongoClientBuilder().
+		WithHost(c.endpoint.Host).
+		WithPort(c.endpoint.Port).
+		WithDirectConnection(true).
+		Build()
+}
+
+func (c *TestMultiMongoConfig) AnalyticsClient(
+	_ struct {
+		Qualifier `Name:"analyticsClient"`
+	},
+) (*mongo.Client, Error) {
+	return NewMongoClientBuilder().
+		WithHost(c.endpoint.Host).
+		WithPort(c.endpoint.Port).
+		WithDirectConnection(true).
+		Build()
+}
+
+func (c *TestMultiMongoConfig) Database(
+	that struct {
+		ConditionalOnMissingBeam
+		client *mongo.Client `@:"Inject"`
+	},
+) *mongo.Database {
+	return that.client.Database("test_multi")
+}
+
+var _, _ = any(&TestMultiMongoConfig{}).(Stereotype)
+
+type TestMultiClientConsumer struct {
+	Service
+	primary   *mongo.Client `@:"Inject"`
+	analytics *mongo.Client `@:"Inject,Qualifier{analyticsClient}"`
+}
+
+var _, _ = any(&TestMultiClientConsumer{}).(Stereotype)
 
 var _ = Describe("Coverage Edge Cases", Ordered, func() {
 	var (
@@ -224,7 +329,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 		var err error
 		mongodbContainer, err = container.Run(
 			ctx,
-			"mongo:latest",
+			"mongo:8.2.7",
 			container.WithReplicaSet("rs0"),
 			testcontainers.WithLogger(GetLogger()),
 		)
@@ -331,20 +436,22 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 		Expect(GetContainer().Initialize()).To(HaveOccurred())
 		GetContainer().Reset()
 
-		// 3. Multiple MongoDB clients/databases registered through a single Configuration with Primary + Qualifier
-		type MultiMongoConfig struct {
-			Configuration
-		}
-		// Verify multiple builders can be instantiated cleanly
-		c1, err1 := NewMongoClientBuilder().WithHost(mongoHost).WithPort(mongoPort).WithDirectConnection(true).Build()
-		Expect(err1).NotTo(HaveOccurred())
-		c2, err2 := NewMongoClientBuilder().WithURI(mongoURI).Build()
-		Expect(err2).NotTo(HaveOccurred())
-		_ = MultiMongoConfig{}
-		Expect(c1.Database("db1").Name()).To(Equal("db1"))
-		Expect(c2.Database("db2").Name()).To(Equal("db2"))
-		Expect(c1.Disconnect(context.Background())).NotTo(HaveOccurred())
-		Expect(c2.Disconnect(context.Background())).NotTo(HaveOccurred())
+		// 3. Multiple MongoDB clients registered through a single Configuration with Primary + Qualifier
+		AddBeamFor(&TestMultiMongoConfig{})
+		AddBeamFor(&TestMongoEndpoint{Host: mongoHost, Port: mongoPort})
+		AddBeamFor(&TestMultiClientConsumer{})
+		GetContainer().EnableScanning()
+		Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
+
+		consumer := GetBeamScopedInstance[*TestMultiClientConsumer]()
+		Expect(consumer).NotTo(BeNil())
+		Expect(consumer.primary).NotTo(BeNil())
+		Expect(consumer.analytics).NotTo(BeNil())
+		// Assert unqualified resolution returns primary client and qualified resolution returns other client
+		Expect(consumer.primary).NotTo(BeIdenticalTo(consumer.analytics))
+		Expect(consumer.primary.Disconnect(context.Background())).NotTo(HaveOccurred())
+		Expect(consumer.analytics.Disconnect(context.Background())).NotTo(HaveOccurred())
+		GetContainer().Reset()
 	})
 
 	It("covers MongoTransactionalManager Start(nil), nil logger, and StartSession error on unconnected client", func() {
@@ -408,7 +515,11 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			ptrEntRepo     *PtrEntityRepository
 			primRepo       *PrimitiveEntityRepository
 			userRepo       *UserRepository
+			likeRepo       *LikeRepo
 			inlineNoIDRepo *InlineNoIDRepository
+			workOrderRepo  *WorkOrderRepo
+			intIDRepo      *IntIDRepo
+			ptrIDRepo      *PtrIDRepo
 			txMgr          MongoTransactional
 			db             *mongo.Database
 			client         *mongo.Client
@@ -416,6 +527,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 
 		BeforeEach(func() {
 			richRepo = &RichRepository{}
+			likeRepo = &LikeRepo{}
 			cyclicRepo = &CyclicRepository{}
 			ptrNameRepo = &PtrNamerRepository{}
 			boxRepo = &BoxRepository{}
@@ -428,11 +540,15 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			primRepo = &PrimitiveEntityRepository{}
 			userRepo = &UserRepository{}
 			inlineNoIDRepo = &InlineNoIDRepository{}
+			workOrderRepo = &WorkOrderRepo{}
+			intIDRepo = &IntIDRepo{}
+			ptrIDRepo = &PtrIDRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
 			AddBeamFor(&TestMongoEndpoint{Host: mongoHost, Port: mongoPort})
 			AddBeamFor(richRepo)
+			AddBeamFor(likeRepo)
 			AddBeamFor(badInlineRepo)
 			AddBeamFor(inlineNoIDRepo)
 			AddBeamFor(cyclicRepo)
@@ -446,6 +562,9 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(ptrEntRepo)
 			AddBeamFor(primRepo)
 			AddBeamFor(userRepo)
+			AddBeamFor(workOrderRepo)
+			AddBeamFor(intIDRepo)
+			AddBeamFor(ptrIDRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -824,21 +943,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			type LikeRepo struct {
-				findByLabelLike func(string) []RichEntity
-				MongoRepository[RichEntity, string]
-			}
-			lr := &LikeRepo{}
-			GetContainer().Reset()
-			AddBeamFor(&TestMongoConfig{})
-			AddBeamFor(&TestMongoEndpoint{Host: mongoHost, Port: mongoPort})
-			AddBeamFor(lr)
-			GetContainer().EnableScanning()
-			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
-			client = GetBeamScopedInstance[*mongo.Client]()
-
-			Expect(lr.findByLabelLike(`a\_b\%c\`)).To(HaveLen(1))
-			Expect(lr.findByLabelLike(`a_b%`)).To(HaveLen(1))
+			Expect(likeRepo.findByLabelLike(`a\_b\%c\`)).To(HaveLen(1))
+			Expect(likeRepo.findByLabelLike(`a_b%`)).To(HaveLen(1))
 		})
 
 		It("covers repository collection naming, Save/SaveAll/Delete/EnsureIndexes branches, and ID extraction", func() {
@@ -888,7 +994,19 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			noID := &NoIDEntity{Name: "no-id"}
 			_, err = noIDRepo.Save(noID)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(noIDRepo.Delete(noID)).To(HaveOccurred())
+			noIDErr := noIDRepo.Delete(noID)
+			Expect(noIDErr).To(HaveOccurred())
+			Expect(noIDErr.Error()).To(ContainSubstring("use DeleteById with the actual key"))
+
+			// UntaggedIDEntity: Delete fails because untagged "ID" field is not treated as MongoDB _id
+			untaggedRepo := &UntaggedIDRepository{}
+			untaggedErr := untaggedRepo.Delete(&UntaggedIDEntity{ID: "explicit-id", Name: "untagged"})
+			Expect(untaggedErr).To(HaveOccurred())
+			Expect(untaggedErr.Error()).To(ContainSubstring("use DeleteById with the actual key"))
+
+			// UnexportedFieldEntity: findIDField skips unexported fields
+			unexportedRepo := &UnexportedFieldRepo{}
+			Expect(unexportedRepo.Delete(&UnexportedFieldEntity{unexportedID: "id1", Name: "name"})).To(HaveOccurred())
 
 			// Nil inner pointer & non-struct entity for findIDField
 			var nilUserPtr *User
@@ -907,8 +1025,16 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			})
 			Expect(err).To(HaveOccurred())
 
-			// Aborted session errors for all repository methods
+			// EnsureIndexes with non-nil caller context
+			validIdxs, err := userRepo.EnsureIndexes(context.Background(), mongo.IndexModel{
+				Keys: bson.D{{Key: "active", Value: 1}},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(validIdxs).NotTo(BeEmpty())
+
+			// Aborted session errors for all repository and query methods
 			sess := txMgr.Start(context.Background())
+			qPreFinalize := userRepo.Query()
 			Expect(sess.Rollback()).NotTo(HaveOccurred())
 			Expect(userRepo.FindById(primitive.NewObjectID()).IsPresent()).To(BeFalse())
 			_, err = userRepo.FindAll()
@@ -917,7 +1043,303 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(err).To(HaveOccurred())
 			_, err = userRepo.ExistsById(primitive.NewObjectID())
 			Expect(err).To(HaveOccurred())
+
+			// EnsureIndexes returns session error during aborted transaction
+			//nolint:staticcheck // Intentionally testing nil context fallback
+			_, err = userRepo.EnsureIndexes(nil, mongo.IndexModel{Keys: bson.D{{Key: "name", Value: 1}}})
+			Expect(err).To(HaveOccurred())
+
+			// Query created before rollback must fail dynamically when executed after rollback
+			var singleUser User
+			Expect(qPreFinalize.First(&singleUser)).To(HaveOccurred())
+
+			// Direct MongoQuery execution after rollback must fail with TransactionError before calling driver
+			Expect(userRepo.Query().First(&singleUser)).To(HaveOccurred())
+			_, err = userRepo.Query().Count()
+			Expect(err).To(HaveOccurred())
+			_, err = userRepo.Query().Exists()
+			Expect(err).To(HaveOccurred())
+			_, err = userRepo.Query().Delete()
+			Expect(err).To(HaveOccurred())
+			var distinctNames []string
+			Expect(userRepo.Query().Distinct("name", &distinctNames)).To(HaveOccurred())
+			var aggResults []bson.M
+			Expect(userRepo.Query().Aggregate(mongo.Pipeline{}, &aggResults)).To(HaveOccurred())
+
 			txMgr.End()
+
+			// toBsonArray coverage: nil, nil pointer, slice pointer, raw slice, array, scalar, byte slice
+			var nilSlicePtr *[]string
+			slicePtr := &[]string{"p1", "p2"}
+			Expect(ExportToBsonArray(nil)).To(Equal(bson.A{}))
+			Expect(ExportToBsonArray(nilSlicePtr)).To(Equal(bson.A{}))
+			Expect(ExportToBsonArray(slicePtr)).To(Equal(bson.A{"p1", "p2"}))
+			Expect(ExportToBsonArray([]byte{1, 2})).To(Equal(bson.A{byte(1), byte(2)}))
+			Expect(ExportToBsonArray([2]int{10, 20})).To(Equal(bson.A{10, 20}))
+			Expect(ExportToBsonArray("scalar")).To(Equal(bson.A{"scalar"}))
+
+			// copyFilter coverage: nil, bson.M, map[string]any, bson.D, []bson.E, bson.A, []any, scalar
+			Expect(ExportCopyFilter(nil)).To(BeNil())
+			Expect(ExportCopyFilter(bson.M{"k": "v"})).To(Equal(bson.M{"k": "v"}))
+			Expect(ExportCopyFilter(map[string]any{"k": "v"})).To(Equal(map[string]any{"k": "v"}))
+			Expect(ExportCopyFilter(bson.D{{Key: "k", Value: "v"}})).To(Equal(bson.D{{Key: "k", Value: "v"}}))
+			Expect(ExportCopyFilter([]bson.E{{Key: "k", Value: "v"}})).To(Equal([]bson.E{{Key: "k", Value: "v"}}))
+			Expect(ExportCopyFilter(bson.A{"item"})).To(Equal(bson.A{"item"}))
+			Expect(ExportCopyFilter([]any{"item"})).To(Equal([]any{"item"}))
+			Expect(ExportCopyFilter(123)).To(Equal(123))
+
+			// Defensive copy mutation check
+			origMap := bson.M{"a": 1}
+			mutQ := userRepo.Query().Where(origMap)
+			origMap["a"] = 99
+			Expect(mutQ.Filter()).To(Equal(bson.M{"a": 1}))
+			retMap, ok := mutQ.Filter().(bson.M)
+			Expect(ok).To(BeTrue())
+			retMap["a"] = 999
+			Expect(mutQ.Filter()).To(Equal(bson.M{"a": 1}))
+
+			// Client builder host normalization, explicit false direct connection, zero pool sizes
+			bNorm := NewMongoClientBuilder().
+				WithHost("[::1]").
+				WithPort(27017).
+				WithMaxPoolSize(0).
+				WithMinPoolSize(0).
+				WithDirectConnection(false)
+			bNormOpts := bNorm.BuildOptions()
+			Expect(bNormOpts.Direct).NotTo(BeNil())
+			Expect(*bNormOpts.Direct).To(BeFalse())
+			Expect(bNormOpts.MaxPoolSize).NotTo(BeNil())
+			Expect(*bNormOpts.MaxPoolSize).To(Equal(uint64(0)))
+			Expect(bNormOpts.MinPoolSize).NotTo(BeNil())
+			Expect(*bNormOpts.MinPoolSize).To(Equal(uint64(0)))
+
+			// 1. WorkOrderRepo: WorkOrderByName field matching vs OrderBy clause
+			_, err = workOrderRepo.Save(&WorkOrderEntity{
+				WorkOrderByName: "order-alpha",
+				Status:          "open",
+				Name:            "alpha",
+				AgeLess:         5,
+				Age:             25,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			woItem := workOrderRepo.findByWorkOrderByName("order-alpha")
+			Expect(woItem).NotTo(BeNil())
+			Expect(woItem.WorkOrderByName).To(Equal("order-alpha"))
+			woList := workOrderRepo.findByStatusOrderByName("open")
+			Expect(woList).To(HaveLen(1))
+			woAgeList := workOrderRepo.findByAgeLessThan(30)
+			Expect(woAgeList).To(HaveLen(1))
+			woByStatus := workOrderRepo.findByStatusOrderByWorkOrderByName("open")
+			Expect(woByStatus).To(HaveLen(1))
+			Expect(woByStatus[0].WorkOrderByName).To(Equal("order-alpha"))
+
+			// 2. IntIDRepo: integer ID 0 treated as existing key in Save, SaveAll, Delete
+			intEnt := &IntIDEntity{ID: 0, Name: "zero-initial"}
+			_, err = intIDRepo.Save(intEnt)
+			Expect(err).NotTo(HaveOccurred())
+			foundInt, ok := intIDRepo.FindById(0).Get()
+			Expect(ok).To(BeTrue())
+			Expect(foundInt.Name).To(Equal("zero-initial"))
+
+			// Upsert integer ID 0 via SaveAll
+			intEnt.Name = "zero-updated"
+			_, err = intIDRepo.SaveAll([]*IntIDEntity{intEnt})
+			Expect(err).NotTo(HaveOccurred())
+			foundInt, ok = intIDRepo.FindById(0).Get()
+			Expect(ok).To(BeTrue())
+			Expect(foundInt.Name).To(Equal("zero-updated"))
+
+			// Delete integer ID 0
+			Expect(intIDRepo.Delete(&IntIDEntity{ID: 0})).NotTo(HaveOccurred())
+			Expect(intIDRepo.FindById(0).IsPresent()).To(BeFalse())
+
+			// 3. PtrIDRepo: entity with nil ID tagged bson:"_id,omitempty" retains generated ID in SaveAll
+			ptrEnt := &PtrIDEntity{Name: "bulk-generated-id"}
+			savedPtrs, err := ptrIDRepo.SaveAll([]*PtrIDEntity{ptrEnt})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(savedPtrs).To(HaveLen(1))
+			Expect(ptrEnt.ID).NotTo(BeNil())
+			Expect(ptrEnt.ID.IsZero()).To(BeFalse())
+
+			// Entity without settable ID field in SaveAll is rejected
+			noIDEnt := &NoIDEntity{Name: "no-id-bulk"}
+			_, err = noIDRepo.SaveAll([]*NoIDEntity{noIDEnt})
+			Expect(err).To(HaveOccurred())
+
+			// 4. Order compound maps rejected; single-key accepted
+			compMapQ1 := userRepo.Query().Order(bson.M{"a": 1, "b": 1})
+			Expect(compMapQ1.Error()).To(HaveOccurred())
+			compMapQ2 := userRepo.Query().Order(map[string]any{"a": 1, "b": 1})
+			Expect(compMapQ2.Error()).To(HaveOccurred())
+			singleMapQ := userRepo.Query().Order(bson.M{"a": 1})
+			Expect(singleMapQ.Error()).NotTo(HaveOccurred())
+
+			// 5. Distinct numeric range checks
+			Expect(ExportConvertDistinctValue(nil, reflect.TypeFor[int]())).NotTo(BeNil())
+			val25, err := ExportConvertDistinctValue(25, reflect.TypeFor[uint8]())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val25.Interface()).To(Equal(uint8(25)))
+
+			_, err = ExportConvertDistinctValue(257, reflect.TypeFor[uint8]())
+			Expect(err).To(HaveOccurred())
+
+			_, err = ExportConvertDistinctValue(-1, reflect.TypeFor[uint8]())
+			Expect(err).To(HaveOccurred())
+
+			// Additional numeric bounds coverage
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[int8]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(200)), reflect.TypeFor[int8]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(-200)), reflect.TypeFor[int8]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[int16]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(40000)), reflect.TypeFor[int16]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[int32]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[int]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[int64]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[uint16]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(70000)), reflect.TypeFor[uint16]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[uint32]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[uint]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[uint64]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[float32]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[float64]())).To(BeTrue())
+
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[int8]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(200)), reflect.TypeFor[int8]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[int16]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(40000)), reflect.TypeFor[int16]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[int32]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[int]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[int64]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[uint8]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(300)), reflect.TypeFor[uint8]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[uint16]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(70000)), reflect.TypeFor[uint16]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[uint32]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[uint]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[uint64]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[float32]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[float64]())).To(BeTrue())
+
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[int8]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(200.5)), reflect.TypeFor[int8]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[int16]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(40000.5)), reflect.TypeFor[int16]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[int32]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[int]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[int64]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[uint8]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(-5.0)), reflect.TypeFor[uint8]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(300.0)), reflect.TypeFor[uint8]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[uint16]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(70000.0)), reflect.TypeFor[uint16]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[uint32]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[uint]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[uint64]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[float32]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10.5)), reflect.TypeFor[float64]())).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf("not-numeric"), reflect.TypeFor[int]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(int64(10)), reflect.TypeFor[string]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[string]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10)), reflect.TypeFor[string]())).To(BeFalse())
+
+			// 6. Aggregate destination validation
+			Expect(userRepo.Query().Aggregate(mongo.Pipeline{}, []bson.M{})).To(HaveOccurred())
+			Expect(userRepo.Query().Aggregate(mongo.Pipeline{}, &User{})).To(HaveOccurred())
+
+			// validateExecution with query error
+			qWithErr := userRepo.Query().AddError(NewError("CustomErr", "bad"))
+			Expect(qWithErr.Find(&[]User{})).To(HaveOccurred())
+
+			// convertDistinctValue with CanConvert (non-numeric convertible types)
+			convVal, convErr := ExportConvertDistinctValue([]byte("hello"), reflect.TypeFor[string]())
+			Expect(convErr).NotTo(HaveOccurred())
+			Expect(convVal.Interface()).To(Equal("hello"))
+
+			// entityIDStatus nil, invalid BSON, zero ObjectID without omitempty
+			_, _, hasID := ExportEntityIDStatus(nil)
+			Expect(hasID).To(BeFalse())
+
+			type unmarshalableDoc struct {
+				Ch chan int `bson:"ch"`
+				ID int      `bson:"_id"`
+			}
+			_, _, hasID = ExportEntityIDStatus(&unmarshalableDoc{ID: 1, Ch: make(chan int)})
+			Expect(hasID).To(BeFalse())
+
+			type nonOmitemptyDoc struct {
+				ID primitive.ObjectID `bson:"_id"`
+			}
+			_, _, hasID = ExportEntityIDStatus(&nonOmitemptyDoc{ID: primitive.NilObjectID})
+			Expect(hasID).To(BeFalse())
+
+			// assignGeneratedID with non-ObjectID field
+			strVal := "hello"
+			Expect(ExportAssignGeneratedID(reflect.ValueOf(&strVal).Elem())).To(BeFalse())
+
+			// 7. Execute and ExecuteWithResult APIs
+			mgr := txMgr.(*MongoTransactionalManager)
+			exRes, exErr := ExecuteWithResult(context.Background(), mgr, func(_ *MongoSession) (string, Error) {
+				return "success", nil
+			})
+			Expect(exErr).NotTo(HaveOccurred())
+			Expect(exRes).To(Equal("success"))
+
+			_, exErr = ExecuteWithResult(context.Background(), mgr, func(_ *MongoSession) (string, Error) {
+				return "", NewError("ActionError", "action failed")
+			})
+			Expect(exErr).To(HaveOccurred())
+
+			_, exErr = ExecuteWithResult[string](context.Background(), nil, nil)
+			Expect(exErr).To(HaveOccurred())
+
+			exErr = mgr.Execute(context.Background(), func(_ *MongoSession) Error {
+				return nil
+			})
+			Expect(exErr).NotTo(HaveOccurred())
+
+			exErr = mgr.Execute(context.Background(), func(_ *MongoSession) Error {
+				return NewError("ActionError", "failed")
+			})
+			Expect(exErr).To(HaveOccurred())
+
+			// Execute with panic recovery
+			panicErr := mgr.Execute(context.Background(), func(_ *MongoSession) Error {
+				panic("callback panic")
+			})
+			Expect(panicErr).To(HaveOccurred())
+
+			// ExecuteWithResult with panic recovery
+			_, panicResErr := ExecuteWithResult(context.Background(), mgr, func(_ *MongoSession) (int, Error) {
+				panic("callback panic")
+			})
+			Expect(panicResErr).To(HaveOccurred())
+
+			// 8. Nested transaction management (Start/End stack restoration)
+			sOuter := mgr.Start(context.Background())
+			Expect(mgr.Get()).To(Equal(sOuter))
+			sInner := mgr.Start(context.Background())
+			Expect(mgr.Get()).To(Equal(sInner))
+			mgr.End()
+			Expect(mgr.Get()).To(Equal(sOuter))
+			mgr.End()
+
+			// 9. Canceled context Rollback and End
+			cancelCtx, cancelFn := context.WithCancel(context.Background())
+			sCancel := mgr.Start(cancelCtx)
+			cancelFn()
+			Expect(sCancel.Rollback()).NotTo(HaveOccurred())
+			mgr.End()
+
+			// 10. Command logging opt-in builder verification
+			bCmdOn := NewMongoClientBuilder().WithLogSink(MongoLogSink{}.New()).WithCommandLogging(true)
+			bCmdOnOpts := bCmdOn.BuildOptions()
+			Expect(bCmdOnOpts.LoggerOptions).NotTo(BeNil())
+			Expect(bCmdOnOpts.LoggerOptions.ComponentLevels[options.LogComponentCommand]).To(Equal(options.LogLevelDebug))
+
+			bCmdOff := NewMongoClientBuilder().WithLogSink(MongoLogSink{}.New()).WithCommandLogging(false)
+			bCmdOffOpts := bCmdOff.BuildOptions()
+			Expect(bCmdOffOpts.LoggerOptions).NotTo(BeNil())
+			Expect(bCmdOffOpts.LoggerOptions.ComponentLevels[options.LogComponentCommand]).To(Equal(options.LogLevel(0)))
 
 			// Driver errors via Disconnect for Delete, DeleteById, Save (ReplaceOne + InsertOne), SaveAll, ExistsById
 			Expect(client.Disconnect(context.Background())).NotTo(HaveOccurred())

@@ -24,6 +24,7 @@ Create a builder via `NewMongoClientBuilder()`, which defaults to `127.0.0.1:270
 | `WithMinPoolSize(size uint64)` | Sets minimum connection pool size. |
 | `WithDirectConnection(direct bool)` | Enables direct single-host connection mode (useful for single-node replica sets). |
 | `WithLogSink(sink options.LogSink)` | Sets a custom `options.LogSink` (such as the auto-configured `options.LogSink` Beam). |
+| `WithCommandLogging(enabled bool)` | Opt-in to MongoDB command payload logging (disabled by default to prevent sensitive query data from being logged). |
 | `WithOptions(fn func(*options.ClientOptions))` | Escape hatch to customize any `*options.ClientOptions` field prior to connecting. |
 | `Build(ctx ...context.Context) (*mongo.Client, Error)` | Connects to MongoDB, verifies with `Ping`, and returns `*mongo.Client`. |
 | `BuildDatabase(name string, ctx ...context.Context) (*mongo.Database, Error)` | Connects and returns `*mongo.Database` directly. |
@@ -38,6 +39,7 @@ package config
 
 import (
     "go.mongodb.org/mongo-driver/mongo"
+    "go.mongodb.org/mongo-driver/mongo/options"
 
     . "github.com/BeamFoundry/rays-data-mongo/pkg/tx"
     . "github.com/BeamFoundry/rays/pkg/core"

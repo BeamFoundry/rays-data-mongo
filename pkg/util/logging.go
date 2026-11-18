@@ -18,6 +18,12 @@ func (this MongoLogSink) New() *MongoLogSink {
 	return &this
 }
 
+// WithLogger initializes or updates the [Logging] instance on the sink.
+func (this *MongoLogSink) WithLogger(logger Logging) *MongoLogSink {
+	this.logger = logger
+	return this
+}
+
 // Info logs a non-error driver message mapped from the driver's verbosity level to Rays logging levels.
 func (this *MongoLogSink) Info(level int, message string, keysAndValues ...any) {
 	if this.logger == nil {

@@ -129,14 +129,12 @@ var _ = Describe("MongoQueryFunc Utilities", Ordered, func() {
 		fn := Paginate(0, 0)
 		var wg sync.WaitGroup
 		for range 10 {
-			wg.Add(1)
-			go func() {
+			wg.Go(func() {
 				defer GinkgoRecover()
-				defer wg.Done()
 				var users []User
 				Expect(baseQuery.Scopes(fn).Find(&users)).NotTo(HaveOccurred())
 				Expect(users).To(HaveLen(4))
-			}()
+			})
 		}
 		wg.Wait()
 	})

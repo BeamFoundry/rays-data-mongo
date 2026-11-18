@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"reflect"
 	"regexp"
 	"strings"
@@ -13,7 +15,6 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	. "github.com/BeamFoundry/rays-data-mongo/pkg/tx"
 	. "github.com/BeamFoundry/rays/pkg/lang"
 )
 
@@ -54,10 +55,6 @@ func NewMongoQuery(ctx context.Context, db *mongo.Database, collectionName strin
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
-	var initErr Error
-	if ms, ok := baseCtx.(*MongoSession); ok {
-		initErr = ms.Validate()
-	}
 	var coll *mongo.Collection
 	if db != nil && collectionName != "" {
 		coll = db.Collection(collectionName)
@@ -67,7 +64,6 @@ func NewMongoQuery(ctx context.Context, db *mongo.Database, collectionName strin
 		collection:     coll,
 		collectionName: collectionName,
 		ctx:            baseCtx,
-		err:            initErr,
 	}
 }
 
@@ -78,7 +74,9 @@ func (this *MongoQuery) clone() *MongoQuery {
 	c := *this
 	if len(this.andFilters) > 0 {
 		c.andFilters = make([]any, len(this.andFilters))
-		copy(c.andFilters, this.andFilters)
+		for i, f := range this.andFilters {
+			c.andFilters[i] = copyFilter(f)
+		}
 	}
 	if len(this.sort) > 0 {
 		c.sort = make(bson.D, len(this.sort))
@@ -175,7 +173,7 @@ func (this *MongoQuery) Where(filter any) *MongoQuery {
 		return this
 	}
 	q := this.clone()
-	q.andFilters = append(q.andFilters, filter)
+	q.andFilters = append(q.andFilters, copyFilter(filter))
 	return q
 }
 
@@ -189,15 +187,17 @@ func (this *MongoQuery) Or(filters ...any) *MongoQuery {
 	q := this.clone()
 	if len(filters) == 1 && len(q.andFilters) > 0 {
 		existing := q.Filter()
-		q.andFilters = []any{bson.M{bsonOpOr: bson.A{existing, filters[0]}}}
+		q.andFilters = []any{bson.M{bsonOpOr: bson.A{existing, copyFilter(filters[0])}}}
 		return q
 	}
 	if len(filters) == 1 {
-		q.andFilters = append(q.andFilters, filters[0])
+		q.andFilters = append(q.andFilters, copyFilter(filters[0]))
 		return q
 	}
 	orSlice := make(bson.A, 0, len(filters))
-	orSlice = append(orSlice, filters...)
+	for _, f := range filters {
+		orSlice = append(orSlice, copyFilter(f))
+	}
 	q.andFilters = append(q.andFilters, bson.M{bsonOpOr: orSlice})
 	return q
 }
@@ -228,10 +228,18 @@ func (this *MongoQuery) Order(sort any) *MongoQuery {
 	case bson.E:
 		q.sort = append(q.sort, s)
 	case bson.M:
+		if len(s) > 1 {
+			q.err = NewError("IllegalArgumentError", "Compound sort requires bson.D for deterministic key ordering; map with multiple keys is not supported")
+			return q
+		}
 		for k, v := range s {
 			q.sort = append(q.sort, bson.E{Key: k, Value: v})
 		}
 	case map[string]any:
+		if len(s) > 1 {
+			q.err = NewError("IllegalArgumentError", "Compound sort requires bson.D for deterministic key ordering; map with multiple keys is not supported")
+			return q
+		}
 		for k, v := range s {
 			q.sort = append(q.sort, bson.E{Key: k, Value: v})
 		}
@@ -348,10 +356,12 @@ func (this *MongoQuery) Filter() any {
 	case 0:
 		return bson.D{}
 	case 1:
-		return this.andFilters[0]
+		return copyFilter(this.andFilters[0])
 	default:
 		andSlice := make(bson.A, 0, len(this.andFilters))
-		andSlice = append(andSlice, this.andFilters...)
+		for _, f := range this.andFilters {
+			andSlice = append(andSlice, copyFilter(f))
+		}
 		return bson.M{bsonOpAnd: andSlice}
 	}
 }
@@ -415,6 +425,11 @@ func (this *MongoQuery) validateExecution() (*mongo.Collection, Error) {
 	}
 	if this.err != nil {
 		return nil, this.err
+	}
+	if validator, ok := this.ctx.(interface{ Validate() Error }); ok && validator != nil {
+		if err := validator.Validate(); err != nil {
+			return nil, err
+		}
 	}
 	coll := this.RawCollection()
 	if coll == nil {
@@ -618,6 +633,11 @@ func (this *MongoQuery) Aggregate(pipeline, dest any) Error {
 		return NewError("IllegalArgumentError", "Destination cannot be nil")
 	}
 
+	destVal := reflect.ValueOf(dest)
+	if destVal.Kind() != reflect.Pointer || destVal.Elem().Kind() != reflect.Slice {
+		return NewError("IllegalArgumentError", "Destination must be a pointer to a slice")
+	}
+
 	aggOpts := options.Aggregate()
 	if this.maxTime != nil {
 		aggOpts.SetMaxTime(*this.maxTime)
@@ -643,6 +663,109 @@ func (this *MongoQuery) Aggregate(pipeline, dest any) Error {
 	return nil
 }
 
+func isNumericKind(k reflect.Kind) bool {
+	return k >= reflect.Int && k <= reflect.Float64
+}
+
+func fitsNumericRange(val reflect.Value, targetType reflect.Type) bool {
+	srcKind := val.Kind()
+	dstKind := targetType.Kind()
+
+	switch {
+	case srcKind >= reflect.Int && srcKind <= reflect.Int64:
+		v := val.Int()
+		switch dstKind {
+		case reflect.Int8:
+			return v >= math.MinInt8 && v <= math.MaxInt8
+		case reflect.Int16:
+			return v >= math.MinInt16 && v <= math.MaxInt16
+		case reflect.Int32:
+			return v >= math.MinInt32 && v <= math.MaxInt32
+		case reflect.Int:
+			return v >= math.MinInt && v <= math.MaxInt
+		case reflect.Int64, reflect.Float64:
+			return true
+		case reflect.Uint8:
+			return v >= 0 && v <= math.MaxUint8
+		case reflect.Uint16:
+			return v >= 0 && v <= math.MaxUint16
+		case reflect.Uint32:
+			return v >= 0 && v <= math.MaxUint32
+		case reflect.Uint:
+			return v >= 0 && uint64(v) <= math.MaxUint
+		case reflect.Uint64:
+			return v >= 0
+		case reflect.Float32:
+			f := float64(v)
+			return f >= -math.MaxFloat32 && f <= math.MaxFloat32
+		default:
+			return false
+		}
+
+	case srcKind >= reflect.Uint && srcKind <= reflect.Uint64:
+		u := val.Uint()
+		switch dstKind {
+		case reflect.Int8:
+			return u <= math.MaxInt8
+		case reflect.Int16:
+			return u <= math.MaxInt16
+		case reflect.Int32:
+			return u <= math.MaxInt32
+		case reflect.Int:
+			return u <= uint64(math.MaxInt)
+		case reflect.Int64:
+			return u <= math.MaxInt64
+		case reflect.Uint8:
+			return u <= math.MaxUint8
+		case reflect.Uint16:
+			return u <= math.MaxUint16
+		case reflect.Uint32:
+			return u <= math.MaxUint32
+		case reflect.Uint:
+			return u <= math.MaxUint
+		case reflect.Uint64, reflect.Float64:
+			return true
+		case reflect.Float32:
+			return float64(u) <= math.MaxFloat32
+		default:
+			return false
+		}
+
+	case srcKind == reflect.Float32 || srcKind == reflect.Float64:
+		f := val.Float()
+		switch dstKind {
+		case reflect.Int8:
+			return f >= math.MinInt8 && f <= math.MaxInt8
+		case reflect.Int16:
+			return f >= math.MinInt16 && f <= math.MaxInt16
+		case reflect.Int32:
+			return f >= math.MinInt32 && f <= math.MaxInt32
+		case reflect.Int:
+			return f >= float64(math.MinInt) && f <= float64(math.MaxInt)
+		case reflect.Int64:
+			return f >= math.MinInt64 && f <= math.MaxInt64
+		case reflect.Uint8:
+			return f >= 0 && f <= math.MaxUint8
+		case reflect.Uint16:
+			return f >= 0 && f <= math.MaxUint16
+		case reflect.Uint32:
+			return f >= 0 && f <= math.MaxUint32
+		case reflect.Uint:
+			return f >= 0 && f <= float64(math.MaxUint)
+		case reflect.Uint64:
+			return f >= 0 && f <= math.MaxUint64
+		case reflect.Float32:
+			return f >= -math.MaxFloat32 && f <= math.MaxFloat32
+		case reflect.Float64:
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
 func convertDistinctValue(val any, targetType reflect.Type) (reflect.Value, Error) {
 	if val == nil {
 		return reflect.Zero(targetType), nil
@@ -651,7 +774,13 @@ func convertDistinctValue(val any, targetType reflect.Type) (reflect.Value, Erro
 	if rawVal.Type().AssignableTo(targetType) {
 		return rawVal, nil
 	}
-	if rawVal.Type().ConvertibleTo(targetType) {
+	if isNumericKind(rawVal.Kind()) && isNumericKind(targetType.Kind()) {
+		if !fitsNumericRange(rawVal, targetType) {
+			return reflect.Value{}, NewError("IllegalArgumentError", fmt.Sprintf("Value %v is out of range for destination type %s", val, targetType.String()))
+		}
+		return rawVal.Convert(targetType), nil
+	}
+	if rawVal.CanConvert(targetType) {
 		return rawVal.Convert(targetType), nil
 	}
 
@@ -672,6 +801,58 @@ func convertDistinctValue(val any, targetType reflect.Type) (reflect.Value, Erro
 		return reflect.Value{}, NewWrappedError("MongoError", err)
 	}
 	return out, nil
+}
+
+func copyFilter(val any) any {
+	if val == nil {
+		return nil
+	}
+	switch v := val.(type) {
+	case bson.M:
+		out := make(bson.M, len(v))
+		for k, val := range v {
+			out[k] = copyFilter(val)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, val := range v {
+			out[k] = copyFilter(val)
+		}
+		return out
+	case bson.D:
+		out := make(bson.D, len(v))
+		for i, elem := range v {
+			out[i] = bson.E{
+				Key:   elem.Key,
+				Value: copyFilter(elem.Value),
+			}
+		}
+		return out
+	case []bson.E:
+		out := make([]bson.E, len(v))
+		for i, elem := range v {
+			out[i] = bson.E{
+				Key:   elem.Key,
+				Value: copyFilter(elem.Value),
+			}
+		}
+		return out
+	case bson.A:
+		out := make(bson.A, len(v))
+		for i, elem := range v {
+			out[i] = copyFilter(elem)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, elem := range v {
+			out[i] = copyFilter(elem)
+		}
+		return out
+	default:
+		return val
+	}
 }
 
 // Where Mode
@@ -788,9 +969,9 @@ func (this *whereQuery) Filter(args ...any) bson.M {
 		suffix, _ := args[0].(string)
 		return bson.M{field: primitive.Regex{Pattern: regexp.QuoteMeta(suffix) + "$"}}
 	case operators.IN:
-		return bson.M{field: bson.M{"$in": args[0]}}
+		return bson.M{field: bson.M{"$in": toBsonArray(args[0])}}
 	case operators.NOTIN:
-		return bson.M{field: bson.M{"$nin": args[0]}}
+		return bson.M{field: bson.M{"$nin": toBsonArray(args[0])}}
 	case operators.TRUE, operators.ISTRUE:
 		return bson.M{field: true}
 	case operators.FALSE, operators.ISFALSE:
@@ -799,6 +980,27 @@ func (this *whereQuery) Filter(args ...any) bson.M {
 		// Handles operators.IS and operators.EQUALS
 		return bson.M{field: args[0]}
 	}
+}
+
+func toBsonArray(val any) bson.A {
+	if val == nil {
+		return bson.A{}
+	}
+	rv := reflect.ValueOf(val)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return bson.A{}
+		}
+		rv = rv.Elem()
+	}
+	if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
+		arr := make(bson.A, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			arr[i] = rv.Index(i).Interface()
+		}
+		return arr
+	}
+	return bson.A{val}
 }
 
 func likeToRegex(pattern string) string {
