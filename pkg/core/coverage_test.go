@@ -246,13 +246,37 @@ type InlineMapRepo struct {
 type DescEntity struct {
 	Name        string             `bson:"name"`
 	Description string             `bson:"description"`
+	Age         int                `bson:"age"`
 	ID          primitive.ObjectID `bson:"_id,omitempty"`
 }
 
 type DescRepo struct {
-	FindByNameOrderByDescriptionAsc     func(string) []DescEntity
-	FindByDescriptionOrderByDescription func(string) []DescEntity
+	FindByNameOrderByDescriptionAsc        func(string) []DescEntity
+	FindByDescriptionOrderByDescription    func(string) []DescEntity
+	FindByNameOrderByAgeDescriptionAsc     func(string) []DescEntity
+	FindByNameOrderByAgeDescDescriptionAsc func(string) []DescEntity
 	MongoRepository[DescEntity, primitive.ObjectID]
+}
+
+type cyclicMapMarshaler map[string]any
+
+func (c cyclicMapMarshaler) MarshalBSON() ([]byte, error) {
+	//nolint:wrapcheck // Test helper implementing bson.Marshaler
+	return bson.Marshal(bson.M{"val": c["val"]})
+}
+
+type AscFieldEntity struct {
+	Name    string             `bson:"name"`
+	AscCode string             `bson:"asc_code"`
+	Age     int                `bson:"age"`
+	ID      primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+type AscFieldRepo struct {
+	FindByNameOrderByAscCodeAsc    func(string) []AscFieldEntity
+	FindByNameOrderByAscCode       func(string) []AscFieldEntity
+	FindByNameOrderByAgeAscCodeAsc func(string) []AscFieldEntity
+	MongoRepository[AscFieldEntity, primitive.ObjectID]
 }
 
 type errBSONMarshaler struct{}
@@ -587,6 +611,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			nilOIDRepo     *NilOIDRepo
 			inlineMapRepo  *InlineMapRepo
 			descRepo       *DescRepo
+			ascFieldRepo   *AscFieldRepo
 			txMgr          MongoTransactional
 			db             *mongo.Database
 			client         *mongo.Client
@@ -615,6 +640,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			nilOIDRepo = &NilOIDRepo{}
 			inlineMapRepo = &InlineMapRepo{}
 			descRepo = &DescRepo{}
+			ascFieldRepo = &AscFieldRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
@@ -642,6 +668,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(nilOIDRepo)
 			AddBeamFor(inlineMapRepo)
 			AddBeamFor(descRepo)
+			AddBeamFor(ascFieldRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -1657,8 +1684,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			inlineNoIDDoc := &InlineMapEntity{Data: map[string]any{"name": "no_id"}}
 			Expect(inlineMapRepo.Delete(inlineNoIDDoc)).To(HaveOccurred())
 
-			// 19. Sort parsing fallback to implicit direction
-			descDoc := &DescEntity{Name: "item1", Description: "desc1"}
+			// 19. Sort parsing fallback to implicit direction and compound ordering
+			descDoc := &DescEntity{Name: "item1", Description: "desc1", Age: 30}
 			_, err = descRepo.Save(descDoc)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -1668,7 +1695,39 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 
 			foundDescs2 := descRepo.FindByDescriptionOrderByDescription("desc1")
 			Expect(foundDescs2).To(HaveLen(1))
+
+			foundDescs3 := descRepo.FindByNameOrderByAgeDescriptionAsc("item1")
+			Expect(foundDescs3).To(HaveLen(1))
+
+			foundDescs4 := descRepo.FindByNameOrderByAgeDescDescriptionAsc("item1")
+			Expect(foundDescs4).To(HaveLen(1))
 			Expect(descRepo.Delete(descDoc)).NotTo(HaveOccurred())
+
+			// Sort parsing fallback with Asc-prefixed field names
+			ascDoc := &AscFieldEntity{Name: "itemAsc", AscCode: "code1", Age: 25}
+			_, err = ascFieldRepo.Save(ascDoc)
+			Expect(err).NotTo(HaveOccurred())
+
+			foundAscs := ascFieldRepo.FindByNameOrderByAscCodeAsc("itemAsc")
+			Expect(foundAscs).To(HaveLen(1))
+			Expect(foundAscs[0].AscCode).To(Equal("code1"))
+
+			foundAscs2 := ascFieldRepo.FindByNameOrderByAscCode("itemAsc")
+			Expect(foundAscs2).To(HaveLen(1))
+
+			foundAscs3 := ascFieldRepo.FindByNameOrderByAgeAscCodeAsc("itemAsc")
+			Expect(foundAscs3).To(HaveLen(1))
+			Expect(ascFieldRepo.Delete(ascDoc)).NotTo(HaveOccurred())
+
+			// Cyclic custom BSON-marshaler reaches driver's marshaler path without unbounded copying
+			cyclicMap := cyclicMapMarshaler{"val": "cyclic_val"}
+			cyclicMap["self"] = &cyclicMap
+			qCyclic := userRepo.Query().Where(bson.M{"meta": &cyclicMap})
+			Expect(qCyclic.Filter()).NotTo(BeNil())
+			var cyclicFindResult []User
+			Expect(qCyclic.Find(&cyclicFindResult)).NotTo(HaveOccurred())
+			copiedCyclic := ExportCopyFilter(&cyclicMap)
+			Expect(copiedCyclic).NotTo(BeNil())
 
 			// 20. marshalWithCollection with nil collection, empty collection without registry/opts, and custom collection with BSONOptions & registry
 			nilCollBytes, mErr := ExportMarshalWithCollection(nil, bson.M{"a": 1})

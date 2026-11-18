@@ -837,6 +837,10 @@ func convertDistinctValue(val any, targetType reflect.Type) (reflect.Value, Erro
 }
 
 func copyFilter(val any) any {
+	return copyFilterWithVisited(val, make(map[uintptr]bool))
+}
+
+func copyFilterWithVisited(val any, visited map[uintptr]bool) any {
 	if val == nil {
 		return nil
 	}
@@ -847,7 +851,7 @@ func copyFilter(val any) any {
 		}
 		out := make(bson.M, len(v))
 		for k, elem := range v {
-			out[k] = copyFilter(elem)
+			out[k] = copyFilterWithVisited(elem, visited)
 		}
 		return out
 	case map[string]any:
@@ -856,7 +860,7 @@ func copyFilter(val any) any {
 		}
 		out := make(map[string]any, len(v))
 		for k, elem := range v {
-			out[k] = copyFilter(elem)
+			out[k] = copyFilterWithVisited(elem, visited)
 		}
 		return out
 	case bson.D:
@@ -867,7 +871,7 @@ func copyFilter(val any) any {
 		for i, elem := range v {
 			out[i] = bson.E{
 				Key:   elem.Key,
-				Value: copyFilter(elem.Value),
+				Value: copyFilterWithVisited(elem.Value, visited),
 			}
 		}
 		return out
@@ -879,7 +883,7 @@ func copyFilter(val any) any {
 		for i, elem := range v {
 			out[i] = bson.E{
 				Key:   elem.Key,
-				Value: copyFilter(elem.Value),
+				Value: copyFilterWithVisited(elem.Value, visited),
 			}
 		}
 		return out
@@ -889,7 +893,7 @@ func copyFilter(val any) any {
 		}
 		out := make(bson.A, len(v))
 		for i, elem := range v {
-			out[i] = copyFilter(elem)
+			out[i] = copyFilterWithVisited(elem, visited)
 		}
 		return out
 	case []any:
@@ -898,7 +902,7 @@ func copyFilter(val any) any {
 		}
 		out := make([]any, len(v))
 		for i, elem := range v {
-			out[i] = copyFilter(elem)
+			out[i] = copyFilterWithVisited(elem, visited)
 		}
 		return out
 	default:
@@ -911,7 +915,7 @@ func copyFilter(val any) any {
 			n := rv.Len()
 			outSlice := reflect.MakeSlice(rv.Type(), n, n)
 			for i := range n {
-				copiedElem := copyFilter(rv.Index(i).Interface())
+				copiedElem := copyFilterWithVisited(rv.Index(i).Interface(), visited)
 				if copiedElem != nil {
 					outSlice.Index(i).Set(reflect.ValueOf(copiedElem))
 				}
@@ -924,7 +928,7 @@ func copyFilter(val any) any {
 			outMap := reflect.MakeMapWithSize(rv.Type(), rv.Len())
 			iter := rv.MapRange()
 			for iter.Next() {
-				copiedVal := copyFilter(iter.Value().Interface())
+				copiedVal := copyFilterWithVisited(iter.Value().Interface(), visited)
 				var valToSet reflect.Value
 				if copiedVal != nil {
 					valToSet = reflect.ValueOf(copiedVal)
@@ -938,8 +942,13 @@ func copyFilter(val any) any {
 			if rv.IsNil() {
 				return val
 			}
+			ptr := rv.Pointer()
+			if visited[ptr] {
+				return val
+			}
+			visited[ptr] = true
 			newPtr := reflect.New(rv.Type().Elem())
-			copiedElem := copyFilter(rv.Elem().Interface())
+			copiedElem := copyFilterWithVisited(rv.Elem().Interface(), visited)
 			if copiedElem != nil {
 				newPtr.Elem().Set(reflect.ValueOf(copiedElem))
 			}

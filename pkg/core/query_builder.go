@@ -162,19 +162,11 @@ func isNestedDocumentStruct(t reflect.Type) bool {
 	return true
 }
 
-func (this *mongoQueryBuilder[T, ID]) canParseAsOrder(str string) bool {
-	s := str
-	for s != "" {
-		order, rest := this.parseOrderByQuery(s)
-		if order == nil {
-			return false
-		}
-		s = rest
-	}
-	return true
+func (this *mongoQueryBuilder[T, ID]) canParseAsOrder(str string) (query []*orderByQuery, ok bool) {
+	return this.parseOrderByQuery(str)
 }
 
-func (this *mongoQueryBuilder[T, ID]) parseOrderByQuery(s string) (query *orderByQuery, rest string) {
+func (this *mongoQueryBuilder[T, ID]) parseOrderByQuery(s string) (query []*orderByQuery, ok bool) {
 	for _, field := range this.fields {
 		if !String(s).StartsWith(field.camelName) {
 			continue
@@ -182,20 +174,29 @@ func (this *mongoQueryBuilder[T, ID]) parseOrderByQuery(s string) (query *orderB
 		afterField := s[len(field.camelName):]
 		if String(afterField).StartsWith("Asc") {
 			rem := afterField[3:]
-			if rem == "" || this.canParseAsOrder(rem) {
-				return &orderByQuery{field: field, order: orderSortings.ASC}, rem
+			if rem == "" {
+				return []*orderByQuery{{field: field, order: orderSortings.ASC}}, true
+			}
+			if sub, ok := this.parseOrderByQuery(rem); ok {
+				return append([]*orderByQuery{{field: field, order: orderSortings.ASC}}, sub...), true
 			}
 		} else if String(afterField).StartsWith("Desc") {
 			rem := afterField[4:]
-			if rem == "" || this.canParseAsOrder(rem) {
-				return &orderByQuery{field: field, order: orderSortings.DESC}, rem
+			if rem == "" {
+				return []*orderByQuery{{field: field, order: orderSortings.DESC}}, true
+			}
+			if sub, ok := this.parseOrderByQuery(rem); ok {
+				return append([]*orderByQuery{{field: field, order: orderSortings.DESC}}, sub...), true
 			}
 		}
-		if afterField == "" || this.canParseAsOrder(afterField) {
-			return &orderByQuery{field: field, order: orderSortings.ASC}, afterField
+		if afterField == "" {
+			return []*orderByQuery{{field: field, order: orderSortings.ASC}}, true
+		}
+		if sub, ok := this.parseOrderByQuery(afterField); ok {
+			return append([]*orderByQuery{{field: field, order: orderSortings.ASC}}, sub...), true
 		}
 	}
-	return nil, ""
+	return nil, false
 }
 
 func (this *mongoQueryBuilder[T, ID]) parseWhereQuery(s string) (*whereQuery, string, Error) {
@@ -287,6 +288,7 @@ func (this *mongoQueryBuilder[T, ID]) Build(function *reflect.StructField) (*mon
 		return true
 	}
 
+	var parsedOrders []*orderByQuery
 	if !canParseAsConditions(predicateStr) {
 		curr := predicateStr
 		for {
@@ -296,10 +298,13 @@ func (this *mongoQueryBuilder[T, ID]) Build(function *reflect.StructField) (*mon
 			}
 			candCond := predicateStr[:idx]
 			candOrder := predicateStr[idx+7:]
-			if canParseAsConditions(candCond) && candOrder != "" && this.canParseAsOrder(candOrder) {
-				conditionStr = candCond
-				orderStr = candOrder
-				break
+			if canParseAsConditions(candCond) && candOrder != "" {
+				if orders, ok := this.canParseAsOrder(candOrder); ok {
+					conditionStr = candCond
+					orderStr = candOrder
+					parsedOrders = orders
+					break
+				}
 			}
 			curr = predicateStr[:idx]
 		}
@@ -325,10 +330,8 @@ func (this *mongoQueryBuilder[T, ID]) Build(function *reflect.StructField) (*mon
 		query.conditions = append(query.conditions, condition)
 	}
 
-	// 5. Parse Orders
-	for orderStr != "" {
-		order, rest := this.parseOrderByQuery(orderStr)
-		orderStr = rest
+	// 5. Orders
+	for _, order := range parsedOrders {
 		this.logger.Debug("Added ordering", "field", order.field.bsonPath, "order", order.order.String())
 		query.orders = append(query.orders, order)
 	}
