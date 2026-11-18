@@ -3,6 +3,7 @@ package core_test
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
 	"time"
 
@@ -221,6 +222,41 @@ type UnexportedFieldRepo struct {
 type LikeRepo struct {
 	findByLabelLike func(string) []RichEntity
 	MongoRepository[RichEntity, string]
+}
+
+type TeamOrderEntity struct {
+	Name            string             `bson:"name"`
+	TeamOrderByCode string             `bson:"team_order_by_code"`
+	ID              primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+type TeamOrderRepo struct {
+	FindByNameOrderByTeamOrderByCode func(name string) ([]TeamOrderEntity, Error)
+	MongoRepository[TeamOrderEntity, primitive.ObjectID]
+}
+
+type errBSONMarshaler struct{}
+
+func (e errBSONMarshaler) MarshalBSON() ([]byte, error) {
+	return nil, errors.New("marshal boom")
+}
+
+type BadMarshalEntity struct {
+	Field errBSONMarshaler   `bson:"field"`
+	ID    primitive.ObjectID `bson:"_id"`
+}
+
+type BadMarshalRepo struct {
+	MongoRepository[BadMarshalEntity, primitive.ObjectID]
+}
+
+type NilOIDEntity struct {
+	ID   *primitive.ObjectID `bson:"_id"`
+	Name string              `bson:"name"`
+}
+
+type NilOIDRepo struct {
+	MongoRepository[NilOIDEntity, primitive.ObjectID]
 }
 
 type AnonRepository struct {
@@ -447,10 +483,16 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 		Expect(consumer).NotTo(BeNil())
 		Expect(consumer.primary).NotTo(BeNil())
 		Expect(consumer.analytics).NotTo(BeNil())
+		DeferCleanup(func() {
+			if consumer.primary != nil {
+				_ = consumer.primary.Disconnect(context.Background())
+			}
+			if consumer.analytics != nil {
+				_ = consumer.analytics.Disconnect(context.Background())
+			}
+		})
 		// Assert unqualified resolution returns primary client and qualified resolution returns other client
 		Expect(consumer.primary).NotTo(BeIdenticalTo(consumer.analytics))
-		Expect(consumer.primary.Disconnect(context.Background())).NotTo(HaveOccurred())
-		Expect(consumer.analytics.Disconnect(context.Background())).NotTo(HaveOccurred())
 		GetContainer().Reset()
 	})
 
@@ -520,6 +562,9 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			workOrderRepo  *WorkOrderRepo
 			intIDRepo      *IntIDRepo
 			ptrIDRepo      *PtrIDRepo
+			teamRepo       *TeamOrderRepo
+			badMarshalRepo *BadMarshalRepo
+			nilOIDRepo     *NilOIDRepo
 			txMgr          MongoTransactional
 			db             *mongo.Database
 			client         *mongo.Client
@@ -543,6 +588,9 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			workOrderRepo = &WorkOrderRepo{}
 			intIDRepo = &IntIDRepo{}
 			ptrIDRepo = &PtrIDRepo{}
+			teamRepo = &TeamOrderRepo{}
+			badMarshalRepo = &BadMarshalRepo{}
+			nilOIDRepo = &NilOIDRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
@@ -565,6 +613,9 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(workOrderRepo)
 			AddBeamFor(intIDRepo)
 			AddBeamFor(ptrIDRepo)
+			AddBeamFor(teamRepo)
+			AddBeamFor(badMarshalRepo)
+			AddBeamFor(nilOIDRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -1032,9 +1083,28 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(validIdxs).NotTo(BeEmpty())
 
+			// Seed a matching user first
+			seededUser := &User{Name: "seeded_for_qpre", Age: 30}
+			savedSeeded, saveErr := userRepo.Save(seededUser)
+			Expect(saveErr).NotTo(HaveOccurred())
+
 			// Aborted session errors for all repository and query methods
 			sess := txMgr.Start(context.Background())
-			qPreFinalize := userRepo.Query()
+			qPreFinalize := userRepo.Query().Where(bson.M{"name": "seeded_for_qpre"})
+
+			// Query created before rollback must succeed dynamically when executed within active transaction
+			var singleUser User
+			Expect(qPreFinalize.First(&singleUser)).NotTo(HaveOccurred())
+			Expect(singleUser.Name).To(Equal("seeded_for_qpre"))
+
+			// Derived context query execution before commit/rollback succeeds
+			derivedCtx, derivedCancel := context.WithTimeout(sess, 5*time.Second)
+			defer derivedCancel()
+			qDerived := userRepo.Query().WithContext(derivedCtx).Where(bson.M{"name": "seeded_for_qpre"})
+			var singleUserDerived User
+			Expect(qDerived.First(&singleUserDerived)).NotTo(HaveOccurred())
+			Expect(singleUserDerived.Name).To(Equal("seeded_for_qpre"))
+
 			Expect(sess.Rollback()).NotTo(HaveOccurred())
 			Expect(userRepo.FindById(primitive.NewObjectID()).IsPresent()).To(BeFalse())
 			_, err = userRepo.FindAll()
@@ -1049,9 +1119,20 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			_, err = userRepo.EnsureIndexes(nil, mongo.IndexModel{Keys: bson.D{{Key: "name", Value: 1}}})
 			Expect(err).To(HaveOccurred())
 
-			// Query created before rollback must fail dynamically when executed after rollback
-			var singleUser User
-			Expect(qPreFinalize.First(&singleUser)).To(HaveOccurred())
+			// Query created before rollback must fail dynamically when executed after rollback with TransactionError
+			var singleUserAfter User
+			preErr := qPreFinalize.First(&singleUserAfter)
+			Expect(preErr).To(HaveOccurred())
+			Expect(preErr.Name()).To(Equal("TransactionError"))
+
+			// Derived context query execution after rollback returns TransactionError without sending delete
+			derivedErr := qDerived.First(&singleUserAfter)
+			Expect(derivedErr).To(HaveOccurred())
+			Expect(derivedErr.Name()).To(Equal("TransactionError"))
+			derivedCount, derivedDelErr := qDerived.Delete()
+			Expect(derivedDelErr).To(HaveOccurred())
+			Expect(derivedDelErr.Name()).To(Equal("TransactionError"))
+			Expect(derivedCount).To(Equal(int64(0)))
 
 			// Direct MongoQuery execution after rollback must fail with TransactionError before calling driver
 			Expect(userRepo.Query().First(&singleUser)).To(HaveOccurred())
@@ -1068,6 +1149,16 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 
 			txMgr.End()
 
+			// Ended session wrapper operations rejected
+			Expect(sess.Commit()).To(HaveOccurred())
+			Expect(sess.Rollback()).To(HaveOccurred())
+			Expect(sess.Abort()).To(HaveOccurred())
+			Expect(sess.Validate()).To(HaveOccurred())
+			_, delEndedErr := userRepo.Query().WithContext(sess).Delete()
+			Expect(delEndedErr).To(HaveOccurred())
+
+			Expect(userRepo.Delete(savedSeeded)).NotTo(HaveOccurred())
+
 			// toBsonArray coverage: nil, nil pointer, slice pointer, raw slice, array, scalar, byte slice
 			var nilSlicePtr *[]string
 			slicePtr := &[]string{"p1", "p2"}
@@ -1078,14 +1169,31 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(ExportToBsonArray([2]int{10, 20})).To(Equal(bson.A{10, 20}))
 			Expect(ExportToBsonArray("scalar")).To(Equal(bson.A{"scalar"}))
 
-			// copyFilter coverage: nil, bson.M, map[string]any, bson.D, []bson.E, bson.A, []any, scalar
+			// extractValidator nil ctx
+			//nolint:staticcheck // Intentionally testing nil context fallback
+			Expect(ExportExtractValidator(nil)).To(BeNil())
+
+			// copyFilter coverage: nil, typed containers, nil containers, scalar
 			Expect(ExportCopyFilter(nil)).To(BeNil())
+			Expect(ExportCopyFilter(bson.M(nil))).To(Equal(bson.M(nil)))
 			Expect(ExportCopyFilter(bson.M{"k": "v"})).To(Equal(bson.M{"k": "v"}))
+			Expect(ExportCopyFilter(map[string]any(nil))).To(Equal(map[string]any(nil)))
 			Expect(ExportCopyFilter(map[string]any{"k": "v"})).To(Equal(map[string]any{"k": "v"}))
+			Expect(ExportCopyFilter(bson.D(nil))).To(Equal(bson.D(nil)))
 			Expect(ExportCopyFilter(bson.D{{Key: "k", Value: "v"}})).To(Equal(bson.D{{Key: "k", Value: "v"}}))
+			Expect(ExportCopyFilter([]bson.E(nil))).To(Equal([]bson.E(nil)))
 			Expect(ExportCopyFilter([]bson.E{{Key: "k", Value: "v"}})).To(Equal([]bson.E{{Key: "k", Value: "v"}}))
+			Expect(ExportCopyFilter(bson.A(nil))).To(Equal(bson.A(nil)))
 			Expect(ExportCopyFilter(bson.A{"item"})).To(Equal(bson.A{"item"}))
+			Expect(ExportCopyFilter([]any(nil))).To(Equal([]any(nil)))
 			Expect(ExportCopyFilter([]any{"item"})).To(Equal([]any{"item"}))
+			Expect(ExportCopyFilter([]any{nil})).To(Equal([]any{nil}))
+			Expect(ExportCopyFilter([]string(nil))).To(Equal([]string(nil)))
+			Expect(ExportCopyFilter([]string{"a", "b"})).To(Equal([]string{"a", "b"}))
+			Expect(ExportCopyFilter(map[string]string(nil))).To(Equal(map[string]string(nil)))
+			Expect(ExportCopyFilter(map[string]string{"k": "v"})).To(Equal(map[string]string{"k": "v"}))
+			Expect(ExportCopyFilter(map[string]*string{"k": nil})).To(Equal(map[string]*string{"k": nil}))
+			Expect(ExportCopyFilter(map[int]any{1: nil})).To(Equal(map[int]any{1: nil}))
 			Expect(ExportCopyFilter(123)).To(Equal(123))
 
 			// Defensive copy mutation check
@@ -1175,7 +1283,9 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(singleMapQ.Error()).NotTo(HaveOccurred())
 
 			// 5. Distinct numeric range checks
-			Expect(ExportConvertDistinctValue(nil, reflect.TypeFor[int]())).NotTo(BeNil())
+			convVal, err := ExportConvertDistinctValue(nil, reflect.TypeFor[int]())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(convVal.IsValid()).To(BeTrue())
 			val25, err := ExportConvertDistinctValue(25, reflect.TypeFor[uint8]())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(val25.Interface()).To(Equal(uint8(25)))
@@ -1242,6 +1352,17 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(ExportFitsNumericRange(reflect.ValueOf(uint64(10)), reflect.TypeFor[string]())).To(BeFalse())
 			Expect(ExportFitsNumericRange(reflect.ValueOf(float64(10)), reflect.TypeFor[string]())).To(BeFalse())
 
+			// Float64 Int64/Uint64 boundary tests in ExportFitsNumericRange
+			maxInt64Float := 9223372036854775808.0 // 2^63
+			precedingInt64 := math.Nextafter(maxInt64Float, 0)
+			Expect(ExportFitsNumericRange(reflect.ValueOf(maxInt64Float), reflect.TypeFor[int64]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(precedingInt64), reflect.TypeFor[int64]())).To(BeTrue())
+
+			maxUint64Float := 18446744073709551616.0 // 2^64
+			precedingUint64 := math.Nextafter(maxUint64Float, 0)
+			Expect(ExportFitsNumericRange(reflect.ValueOf(maxUint64Float), reflect.TypeFor[uint64]())).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(precedingUint64), reflect.TypeFor[uint64]())).To(BeTrue())
+
 			// 6. Aggregate destination validation
 			Expect(userRepo.Query().Aggregate(mongo.Pipeline{}, []bson.M{})).To(HaveOccurred())
 			Expect(userRepo.Query().Aggregate(mongo.Pipeline{}, &User{})).To(HaveOccurred())
@@ -1256,21 +1377,24 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(convVal.Interface()).To(Equal("hello"))
 
 			// entityIDStatus nil, invalid BSON, zero ObjectID without omitempty
-			_, _, hasID := ExportEntityIDStatus(nil)
+			_, hasID, encErr := ExportEntityIDStatus(nil)
 			Expect(hasID).To(BeFalse())
+			Expect(encErr).NotTo(HaveOccurred())
 
 			type unmarshalableDoc struct {
 				Ch chan int `bson:"ch"`
 				ID int      `bson:"_id"`
 			}
-			_, _, hasID = ExportEntityIDStatus(&unmarshalableDoc{ID: 1, Ch: make(chan int)})
+			_, hasID, encErr = ExportEntityIDStatus(&unmarshalableDoc{ID: 1, Ch: make(chan int)})
 			Expect(hasID).To(BeFalse())
+			Expect(encErr).To(HaveOccurred())
 
 			type nonOmitemptyDoc struct {
 				ID primitive.ObjectID `bson:"_id"`
 			}
-			_, _, hasID = ExportEntityIDStatus(&nonOmitemptyDoc{ID: primitive.NilObjectID})
+			_, hasID, encErr = ExportEntityIDStatus(&nonOmitemptyDoc{ID: primitive.NilObjectID})
 			Expect(hasID).To(BeFalse())
+			Expect(encErr).NotTo(HaveOccurred())
 
 			// assignGeneratedID with non-ObjectID field
 			strVal := "hello"
@@ -1340,6 +1464,65 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			bCmdOffOpts := bCmdOff.BuildOptions()
 			Expect(bCmdOffOpts.LoggerOptions).NotTo(BeNil())
 			Expect(bCmdOffOpts.LoggerOptions.ComponentLevels[options.LogComponentCommand]).To(Equal(options.LogLevel(0)))
+
+			// 11. FindByNameOrderByTeamOrderByCode resolution
+			teamDoc := &TeamOrderEntity{Name: "team_alice", TeamOrderByCode: "CODE_01"}
+			savedTeamDoc, err := teamRepo.Save(teamDoc)
+			Expect(err).NotTo(HaveOccurred())
+			teamResults, err := teamRepo.FindByNameOrderByTeamOrderByCode("team_alice")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(teamResults).To(HaveLen(1))
+			Expect(teamResults[0].TeamOrderByCode).To(Equal("CODE_01"))
+			Expect(teamRepo.Delete(savedTeamDoc)).NotTo(HaveOccurred())
+
+			// 12. Nested []string immutability in Where and returned Filter()
+			origTags := []string{"tag1", "tag2"}
+			qSlice := userRepo.Query().Where(bson.M{"tags": bson.M{"$in": origTags}})
+			origTags[0] = "MUTATED_INPUT"
+			f1, ok := qSlice.Filter().(bson.M)
+			Expect(ok).To(BeTrue())
+			tagsM1, ok := f1["tags"].(bson.M)
+			Expect(ok).To(BeTrue())
+			inSlice1, ok := tagsM1["$in"].([]string)
+			Expect(ok).To(BeTrue())
+			Expect(inSlice1[0]).To(Equal("tag1"))
+
+			inSlice1[0] = "MUTATED_OUTPUT"
+			f2, ok := qSlice.Filter().(bson.M)
+			Expect(ok).To(BeTrue())
+			tagsM2, ok := f2["tags"].(bson.M)
+			Expect(ok).To(BeTrue())
+			inSlice2, ok := tagsM2["$in"].([]string)
+			Expect(ok).To(BeTrue())
+			Expect(inSlice2[0]).To(Equal("tag1"))
+
+			// 13. Save payload encoding error before ID assignment
+			badDoc := &BadMarshalEntity{}
+			savedBad, saveBadErr := badMarshalRepo.Save(badDoc)
+			Expect(saveBadErr).To(HaveOccurred())
+			Expect(saveBadErr.Name()).To(Equal("MongoError"))
+			Expect(badDoc.ID.IsZero()).To(BeTrue()) // ID was not assigned before returning error
+			Expect(savedBad).To(BeNil())
+
+			delBadErr := badMarshalRepo.Delete(badDoc)
+			Expect(delBadErr).To(HaveOccurred())
+			Expect(delBadErr.Name()).To(Equal("MongoError"))
+
+			_, saveAllBadErr := badMarshalRepo.SaveAll([]*BadMarshalEntity{badDoc})
+			Expect(saveAllBadErr).To(HaveOccurred())
+			Expect(saveAllBadErr.Name()).To(Equal("MongoError"))
+
+			// 14. Nil *primitive.ObjectID without omitempty generates new ObjectID
+			nilDoc := &NilOIDEntity{ID: nil, Name: "generated_id_entity"}
+			savedNilDoc, nilSaveErr := nilOIDRepo.Save(nilDoc)
+			Expect(nilSaveErr).NotTo(HaveOccurred())
+			Expect(savedNilDoc.ID).NotTo(BeNil())
+			Expect(savedNilDoc.ID.IsZero()).To(BeFalse())
+
+			foundNilDoc, ok := nilOIDRepo.FindById(*savedNilDoc.ID).Get()
+			Expect(ok).To(BeTrue())
+			Expect(foundNilDoc.Name).To(Equal("generated_id_entity"))
+			Expect(nilOIDRepo.Delete(savedNilDoc)).NotTo(HaveOccurred())
 
 			// Driver errors via Disconnect for Delete, DeleteById, Save (ReplaceOne + InsertOne), SaveAll, ExistsById
 			Expect(client.Disconnect(context.Background())).NotTo(HaveOccurred())

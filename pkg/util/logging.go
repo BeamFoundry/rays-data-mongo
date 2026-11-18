@@ -19,6 +19,8 @@ func (this MongoLogSink) New() *MongoLogSink {
 }
 
 // WithLogger initializes or updates the [Logging] instance on the sink.
+// WithLogger must be called before the sink is handed to the driver; dynamic replacement
+// after the driver starts emitting events is not supported to prevent data races.
 func (this *MongoLogSink) WithLogger(logger Logging) *MongoLogSink {
 	this.logger = logger
 	return this
@@ -26,19 +28,21 @@ func (this *MongoLogSink) WithLogger(logger Logging) *MongoLogSink {
 
 // Info logs a non-error driver message mapped from the driver's verbosity level to Rays logging levels.
 func (this *MongoLogSink) Info(level int, message string, keysAndValues ...any) {
-	if this.logger == nil {
+	log := this.logger
+	if log == nil {
 		return
 	}
 	if level <= 1 {
-		this.logger.Debug(message, keysAndValues...)
+		log.Debug(message, keysAndValues...)
 		return
 	}
-	this.logger.Trace(message, keysAndValues...)
+	log.Trace(message, keysAndValues...)
 }
 
 // Error logs a driver error message through the Rays [Logging] instance.
 func (this *MongoLogSink) Error(err error, message string, keysAndValues ...any) {
-	if this.logger == nil {
+	log := this.logger
+	if log == nil {
 		return
 	}
 	args := make([]any, 0, len(keysAndValues)+2)
@@ -46,5 +50,5 @@ func (this *MongoLogSink) Error(err error, message string, keysAndValues ...any)
 	if err != nil {
 		args = append(args, "error", err)
 	}
-	this.logger.Error(message, args...)
+	log.Error(message, args...)
 }

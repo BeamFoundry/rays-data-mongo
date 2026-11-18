@@ -2,6 +2,7 @@ package autoconfig
 
 import (
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	. "github.com/BeamFoundry/rays-data-mongo/pkg/tx"
 	. "github.com/BeamFoundry/rays-data-mongo/pkg/util"
@@ -23,7 +24,7 @@ func (this *MongoAutoConfig) MongoLogSink(
 	_ struct {
 		ConditionalOnMissingBeam
 	},
-) *MongoLogSink {
+) options.LogSink {
 	return MongoLogSink{}.New().WithLogger(this.logger)
 }
 

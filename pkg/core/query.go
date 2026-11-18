@@ -15,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	"github.com/BeamFoundry/rays-data-mongo/pkg/tx"
 	. "github.com/BeamFoundry/rays/pkg/lang"
 )
 
@@ -33,19 +34,33 @@ type MongoQueryFunc = func(*MongoQuery) *MongoQuery
 type MongoQuery struct {
 	//nolint:containedctx // Stores execution/session context for fluent MongoDB query execution
 	ctx            context.Context
-	database       *mongo.Database
-	collection     *mongo.Collection
-	limit          *int64
-	skip           *int64
-	maxTime        *time.Duration
-	collation      *options.Collation
-	hint           any
+	validator      interface{ Validate() Error }
 	err            Error
+	hint           any
+	collation      *options.Collation
+	maxTime        *time.Duration
+	skip           *int64
+	limit          *int64
+	collection     *mongo.Collection
+	database       *mongo.Database
 	collectionName string
 	andFilters     []any
 	sort           bson.D
 	projection     bson.D
 	extraFindOpts  []*options.FindOptions
+}
+
+func extractValidator(ctx context.Context) interface{ Validate() Error } {
+	if ctx == nil {
+		return nil
+	}
+	if v, ok := ctx.(interface{ Validate() Error }); ok && v != nil {
+		return v
+	}
+	if v, ok := ctx.Value((*tx.MongoSession)(nil)).(interface{ Validate() Error }); ok && v != nil {
+		return v
+	}
+	return nil
 }
 
 // NewMongoQuery creates a new [*MongoQuery] targeting the given database and collection.
@@ -64,6 +79,7 @@ func NewMongoQuery(ctx context.Context, db *mongo.Database, collectionName strin
 		collection:     coll,
 		collectionName: collectionName,
 		ctx:            baseCtx,
+		validator:      extractValidator(baseCtx),
 	}
 }
 
@@ -121,6 +137,9 @@ func (this *MongoQuery) WithContext(ctx context.Context) *MongoQuery {
 	q := this.clone()
 	if ctx != nil {
 		q.ctx = ctx
+		if v := extractValidator(ctx); v != nil {
+			q.validator = v
+		}
 	}
 	return q
 }
@@ -426,8 +445,12 @@ func (this *MongoQuery) validateExecution() (*mongo.Collection, Error) {
 	if this.err != nil {
 		return nil, this.err
 	}
-	if validator, ok := this.ctx.(interface{ Validate() Error }); ok && validator != nil {
-		if err := validator.Validate(); err != nil {
+	v := this.validator
+	if v == nil {
+		v = extractValidator(this.ctx)
+	}
+	if v != nil {
+		if err := v.Validate(); err != nil {
 			return nil, err
 		}
 	}
@@ -741,19 +764,17 @@ func fitsNumericRange(val reflect.Value, targetType reflect.Type) bool {
 		case reflect.Int32:
 			return f >= math.MinInt32 && f <= math.MaxInt32
 		case reflect.Int:
-			return f >= float64(math.MinInt) && f <= float64(math.MaxInt)
+			return f >= float64(math.MinInt) && f < 9223372036854775808.0
 		case reflect.Int64:
-			return f >= math.MinInt64 && f <= math.MaxInt64
+			return f >= math.MinInt64 && f < 9223372036854775808.0
 		case reflect.Uint8:
 			return f >= 0 && f <= math.MaxUint8
 		case reflect.Uint16:
 			return f >= 0 && f <= math.MaxUint16
 		case reflect.Uint32:
 			return f >= 0 && f <= math.MaxUint32
-		case reflect.Uint:
-			return f >= 0 && f <= float64(math.MaxUint)
-		case reflect.Uint64:
-			return f >= 0 && f <= math.MaxUint64
+		case reflect.Uint, reflect.Uint64:
+			return f >= 0 && f < 18446744073709551616.0
 		case reflect.Float32:
 			return f >= -math.MaxFloat32 && f <= math.MaxFloat32
 		case reflect.Float64:
@@ -809,18 +830,27 @@ func copyFilter(val any) any {
 	}
 	switch v := val.(type) {
 	case bson.M:
+		if v == nil {
+			return bson.M(nil)
+		}
 		out := make(bson.M, len(v))
-		for k, val := range v {
-			out[k] = copyFilter(val)
+		for k, elem := range v {
+			out[k] = copyFilter(elem)
 		}
 		return out
 	case map[string]any:
+		if v == nil {
+			return map[string]any(nil)
+		}
 		out := make(map[string]any, len(v))
-		for k, val := range v {
-			out[k] = copyFilter(val)
+		for k, elem := range v {
+			out[k] = copyFilter(elem)
 		}
 		return out
 	case bson.D:
+		if v == nil {
+			return bson.D(nil)
+		}
 		out := make(bson.D, len(v))
 		for i, elem := range v {
 			out[i] = bson.E{
@@ -830,6 +860,9 @@ func copyFilter(val any) any {
 		}
 		return out
 	case []bson.E:
+		if v == nil {
+			return []bson.E(nil)
+		}
 		out := make([]bson.E, len(v))
 		for i, elem := range v {
 			out[i] = bson.E{
@@ -839,19 +872,59 @@ func copyFilter(val any) any {
 		}
 		return out
 	case bson.A:
+		if v == nil {
+			return bson.A(nil)
+		}
 		out := make(bson.A, len(v))
 		for i, elem := range v {
 			out[i] = copyFilter(elem)
 		}
 		return out
 	case []any:
+		if v == nil {
+			return []any(nil)
+		}
 		out := make([]any, len(v))
 		for i, elem := range v {
 			out[i] = copyFilter(elem)
 		}
 		return out
 	default:
-		return val
+		rv := reflect.ValueOf(val)
+		switch rv.Kind() {
+		case reflect.Slice:
+			if rv.IsNil() {
+				return val
+			}
+			n := rv.Len()
+			outSlice := reflect.MakeSlice(rv.Type(), n, n)
+			for i := range n {
+				copiedElem := copyFilter(rv.Index(i).Interface())
+				if copiedElem != nil {
+					outSlice.Index(i).Set(reflect.ValueOf(copiedElem))
+				}
+			}
+			return outSlice.Interface()
+		case reflect.Map:
+			if rv.IsNil() {
+				return val
+			}
+			outMap := reflect.MakeMapWithSize(rv.Type(), rv.Len())
+			iter := rv.MapRange()
+			for iter.Next() {
+				copiedVal := copyFilter(iter.Value().Interface())
+				var valToSet reflect.Value
+				if copiedVal != nil {
+					valToSet = reflect.ValueOf(copiedVal)
+				} else {
+					valToSet = reflect.Zero(rv.Type().Elem())
+				}
+				outMap.SetMapIndex(iter.Key(), valToSet)
+			}
+			return outMap.Interface()
+		default:
+			return val
+		}
 	}
 }
 

@@ -25,23 +25,25 @@ const (
 // and [*mongo.Database] instances inside Rays [Configuration] structs without relying on global
 // ConfigurationProperties.
 type MongoClientBuilder struct {
-	logSink                options.LogSink
-	uri                    string
-	host                   string
-	username               string
-	password               string
-	authSource             string
-	customizers            []func(*options.ClientOptions)
-	connectTimeout         time.Duration
-	serverSelectionTimeout time.Duration
-	maxPoolSize            uint64
-	minPoolSize            uint64
-	port                   int
-	directConnection       bool
-	hasDirectConnection    bool
-	hasMaxPoolSize         bool
-	hasMinPoolSize         bool
-	commandLogging         bool
+	logSink                   options.LogSink
+	uri                       string
+	host                      string
+	username                  string
+	password                  string
+	authSource                string
+	customizers               []func(*options.ClientOptions)
+	connectTimeout            time.Duration
+	serverSelectionTimeout    time.Duration
+	maxPoolSize               uint64
+	minPoolSize               uint64
+	port                      int
+	directConnection          bool
+	hasDirectConnection       bool
+	hasMaxPoolSize            bool
+	hasMinPoolSize            bool
+	hasConnectTimeout         bool
+	hasServerSelectionTimeout bool
+	commandLogging            bool
 }
 
 // NewMongoClientBuilder creates a new [*MongoClientBuilder] with sensible defaults
@@ -82,12 +84,14 @@ func (this *MongoClientBuilder) WithCredentials(username, password, authSource s
 // WithConnectTimeout sets the connection and startup ping timeout.
 func (this *MongoClientBuilder) WithConnectTimeout(d time.Duration) *MongoClientBuilder {
 	this.connectTimeout = d
+	this.hasConnectTimeout = true
 	return this
 }
 
 // WithServerSelectionTimeout sets the server selection timeout.
 func (this *MongoClientBuilder) WithServerSelectionTimeout(d time.Duration) *MongoClientBuilder {
 	this.serverSelectionTimeout = d
+	this.hasServerSelectionTimeout = true
 	return this
 }
 
@@ -155,11 +159,11 @@ func (this *MongoClientBuilder) resolvedURI() string {
 }
 
 func (this *MongoClientBuilder) resolvedConnectTimeout(opts *options.ClientOptions) time.Duration {
-	if this.connectTimeout > 0 {
-		return this.connectTimeout
-	}
 	if opts != nil && opts.ConnectTimeout != nil {
-		return *opts.ConnectTimeout
+		if *opts.ConnectTimeout > 0 {
+			return *opts.ConnectTimeout
+		}
+		return 0
 	}
 	return defaultConnectTimeout
 }
@@ -176,13 +180,13 @@ func (this *MongoClientBuilder) BuildOptions() *options.ClientOptions {
 		})
 	}
 
-	if this.connectTimeout > 0 {
+	if this.hasConnectTimeout {
 		opts.SetConnectTimeout(this.connectTimeout)
 	} else if opts.ConnectTimeout == nil {
 		opts.SetConnectTimeout(defaultConnectTimeout)
 	}
 
-	if this.serverSelectionTimeout > 0 {
+	if this.hasServerSelectionTimeout {
 		opts.SetServerSelectionTimeout(this.serverSelectionTimeout)
 	} else if opts.ServerSelectionTimeout == nil {
 		opts.SetServerSelectionTimeout(defaultSelectTimeout)
@@ -202,6 +206,9 @@ func (this *MongoClientBuilder) BuildOptions() *options.ClientOptions {
 		loggerOpts := options.Logger().SetSink(this.logSink)
 		if this.commandLogging {
 			loggerOpts.SetComponentLevel(options.LogComponentCommand, options.LogLevelDebug)
+		} else {
+			loggerOpts.SetComponentLevel(options.LogComponentCommand, options.LogLevel(0))
+			loggerOpts.SetComponentLevel(options.LogComponentAll, options.LogLevel(0))
 		}
 		opts.SetLoggerOptions(loggerOpts)
 	}
@@ -222,8 +229,15 @@ func (this *MongoClientBuilder) Build(ctx ...context.Context) (*mongo.Client, Er
 	if len(ctx) > 0 && ctx[0] != nil {
 		baseCtx = ctx[0]
 	}
-	connectCtx, cancel := context.WithTimeout(baseCtx, timeout)
-	defer cancel()
+
+	var connectCtx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		connectCtx, cancel = context.WithTimeout(baseCtx, timeout)
+		defer cancel()
+	} else {
+		connectCtx = baseCtx
+	}
 
 	client, err := mongo.Connect(connectCtx, opts)
 	if err != nil {
@@ -231,9 +245,13 @@ func (this *MongoClientBuilder) Build(ctx ...context.Context) (*mongo.Client, Er
 	}
 
 	if err := client.Ping(connectCtx, nil); err != nil {
-		cleanupCtx, cleanupCancel := context.WithTimeout(baseCtx, timeout)
-		defer cleanupCancel()
-		_ = client.Disconnect(cleanupCtx)
+		if timeout > 0 {
+			cleanupCtx, cleanupCancel := context.WithTimeout(baseCtx, timeout)
+			defer cleanupCancel()
+			_ = client.Disconnect(cleanupCtx)
+		} else {
+			_ = client.Disconnect(baseCtx)
+		}
 		return nil, NewWrappedError("MongoConnectionError", err)
 	}
 

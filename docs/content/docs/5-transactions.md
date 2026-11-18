@@ -55,21 +55,23 @@ func (s *OrderService) UpdateUserWithAudit(ctx context.Context, user *User) {
 }
 ```
 
-> **Note:** `Transactional` does not return callback or commit failures to its caller; any error is logged and triggers a rollback. Callers needing the transaction result or explicit error propagation can use `Execute`, `ExecuteWithResult`, or the manual transaction lifecycle.
+> **Note:** `Transactional` does not return callback or commit failures to its caller. If the transaction callback returns an error, `Rollback()` is triggered; when rollback succeeds, the callback error is neither returned nor logged, so it may be lost. If `Commit()` fails, the error is logged and the session ends without calling `Rollback()`, so the transaction outcome may be unknown. Callers needing the transaction result or explicit error propagation can use `Execute`, `ExecuteWithResult`, or manual transaction management.
 
 ## Result-Bearing Transactions (`Execute` and `ExecuteWithResult`)
 
 While `Transactional` conforms to the standard Rays `Transactional[T]` contract, `MongoTransactionalManager` also provides `Execute` and `ExecuteWithResult` so callers can receive results and distinguish errors:
 
 ```go
+mongoTx := s.txManager.(*MongoTransactionalManager)
+
 // Execute returns any startup, callback, or commit error:
-err := s.txManager.Execute(ctx, func(sess *MongoSession) Error {
+err := mongoTx.Execute(ctx, func(sess *MongoSession) Error {
     _, err := s.userRepo.Save(user)
     return err
 })
 
 // ExecuteWithResult returns computed results and propagates errors:
-savedUser, err := ExecuteWithResult(ctx, s.txManager, func(sess *MongoSession) (*User, Error) {
+savedUser, err := ExecuteWithResult(ctx, mongoTx, func(sess *MongoSession) (*User, Error) {
     return s.userRepo.Save(user)
 })
 ```

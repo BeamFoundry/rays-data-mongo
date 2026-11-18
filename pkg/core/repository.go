@@ -185,11 +185,14 @@ func (this *MongoRepository[T, K]) Delete(object *T) Error {
 	if err != nil {
 		return err
 	}
-	_, idVal, hasEncodedID := entityIDStatus(object)
-	if !hasEncodedID {
+	st, encodeErr := entityIDStatus(object)
+	if encodeErr != nil {
+		return encodeErr
+	}
+	if !st.hasEncoded {
 		return NewError("IllegalArgumentError", "Entity does not have a non-zero _id field; use DeleteById with the actual key")
 	}
-	if _, driverErr := this.Collection().DeleteOne(ctx, bson.M{bsonIDField: idVal}); driverErr != nil {
+	if _, driverErr := this.Collection().DeleteOne(ctx, bson.M{bsonIDField: st.val}); driverErr != nil {
 		return NewWrappedError("MongoError", driverErr)
 	}
 	return nil
@@ -219,26 +222,29 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	}
 
 	coll := this.Collection()
-	idField, idVal, hasEncodedID := entityIDStatus(object)
+	st, encodeErr := entityIDStatus(object)
+	if encodeErr != nil {
+		return nil, encodeErr
+	}
 
-	if hasEncodedID {
+	if st.hasEncoded {
 		opts := options.Replace().SetUpsert(true)
-		if _, driverErr := coll.ReplaceOne(ctx, bson.M{bsonIDField: idVal}, object, opts); driverErr != nil {
+		if _, driverErr := coll.ReplaceOne(ctx, bson.M{bsonIDField: st.val}, object, opts); driverErr != nil {
 			return nil, NewWrappedError("MongoError", driverErr)
 		}
 		return object, nil
 	}
 
-	_ = assignGeneratedID(idField)
+	_ = assignGeneratedID(st.field)
 
 	res, driverErr := coll.InsertOne(ctx, object)
 	if driverErr != nil {
 		return nil, NewWrappedError("MongoError", driverErr)
 	}
-	if idField.IsValid() && idField.CanSet() && res.InsertedID != nil {
+	if st.field.IsValid() && st.field.CanSet() && res.InsertedID != nil {
 		insertedVal := reflect.ValueOf(res.InsertedID)
-		if insertedVal.Type().AssignableTo(idField.Type()) {
-			idField.Set(insertedVal)
+		if insertedVal.Type().AssignableTo(st.field.Type()) {
+			st.field.Set(insertedVal)
 		}
 	}
 	return object, nil
@@ -259,14 +265,17 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 		if object == nil {
 			return nil, NewError("IllegalArgumentError", "Cannot save nil entity in SaveAll")
 		}
-		idField, idVal, hasEncodedID := entityIDStatus(object)
-		if hasEncodedID {
+		st, encodeErr := entityIDStatus(object)
+		if encodeErr != nil {
+			return nil, encodeErr
+		}
+		if st.hasEncoded {
 			models = append(models, mongo.NewReplaceOneModel().
-				SetFilter(bson.M{bsonIDField: idVal}).
+				SetFilter(bson.M{bsonIDField: st.val}).
 				SetReplacement(object).
 				SetUpsert(true))
 		} else {
-			if !assignGeneratedID(idField) {
+			if !assignGeneratedID(st.field) {
 				return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in SaveAll")
 			}
 			models = append(models, mongo.NewInsertOneModel().SetDocument(object))
@@ -364,32 +373,49 @@ func findIDField(v reflect.Value) reflect.Value {
 	return reflect.Value{}
 }
 
-func entityIDStatus(object any) (idField reflect.Value, idVal any, hasEncodedID bool) {
+type idStatus struct {
+	val        any
+	field      reflect.Value
+	hasEncoded bool
+}
+
+func entityIDStatus(object any) (idStatus, Error) {
 	if object == nil {
-		return reflect.Value{}, nil, false
+		return idStatus{}, nil
 	}
-	idField = findIDField(reflect.ValueOf(object))
+	idField := findIDField(reflect.ValueOf(object))
 	if !idField.IsValid() {
-		return reflect.Value{}, nil, false
+		return idStatus{}, nil
 	}
 
 	rawBytes, err := bson.Marshal(object)
 	if err != nil {
-		return idField, nil, false
+		return idStatus{field: idField}, NewWrappedError("MongoError", err)
 	}
 	rawVal, err := bson.Raw(rawBytes).LookupErr(bsonIDField)
 	if err != nil {
-		return idField, nil, false
+		//nolint:nilerr // Missing _id field in serialized BSON is expected when omitted
+		return idStatus{field: idField}, nil
+	}
+
+	if rawVal.Type == bson.TypeNull {
+		if idField.Kind() == reflect.Pointer && idField.Type().Elem() == objectIDType && idField.IsNil() {
+			return idStatus{field: idField}, nil
+		}
 	}
 
 	if rawVal.Type == bson.TypeObjectID {
 		oid := rawVal.ObjectID()
 		if oid.IsZero() {
-			return idField, nil, false
+			return idStatus{field: idField}, nil
 		}
-		return idField, oid, true
+		return idStatus{field: idField, val: oid, hasEncoded: true}, nil
 	}
-	return idField, idField.Interface(), true
+
+	var decodedID any
+	//nolint:errcheck // Unmarshaling valid BSON raw value into any cannot fail
+	_ = rawVal.Unmarshal(&decodedID)
+	return idStatus{field: idField, val: decodedID, hasEncoded: true}, nil
 }
 
 func assignGeneratedID(idField reflect.Value) bool {

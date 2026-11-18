@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"reflect"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -18,6 +19,11 @@ func ExportCopyFilter(val any) any {
 	return copyFilter(val)
 }
 
+// ExportExtractValidator exposes extractValidator for package core_test.
+func ExportExtractValidator(ctx context.Context) interface{ Validate() Error } {
+	return extractValidator(ctx)
+}
+
 // ExportConvertDistinctValue exposes convertDistinctValue for package core_test.
 func ExportConvertDistinctValue(val any, targetType reflect.Type) (reflect.Value, Error) {
 	return convertDistinctValue(val, targetType)
@@ -29,8 +35,12 @@ func ExportFitsNumericRange(val reflect.Value, targetType reflect.Type) bool {
 }
 
 // ExportEntityIDStatus exposes entityIDStatus for testing.
-func ExportEntityIDStatus(object any) (reflect.Value, any, bool) {
-	return entityIDStatus(object)
+func ExportEntityIDStatus(object any) (val any, hasEncoded bool, err error) {
+	st, encodeErr := entityIDStatus(object)
+	if encodeErr != nil {
+		return nil, false, encodeErr
+	}
+	return st.val, st.hasEncoded, nil
 }
 
 // ExportAssignGeneratedID exposes assignGeneratedID for testing.

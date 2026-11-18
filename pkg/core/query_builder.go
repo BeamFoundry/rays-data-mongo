@@ -162,7 +162,7 @@ func isNestedDocumentStruct(t reflect.Type) bool {
 	return true
 }
 
-func (this *mongoQueryBuilder[T, ID]) parseOrderByQuery(s string) (*orderByQuery, string, Error) {
+func (this *mongoQueryBuilder[T, ID]) parseOrderByQuery(s string) (query *orderByQuery, rest string) {
 	o := &orderByQuery{
 		order: orderSortings.ASC,
 	}
@@ -182,9 +182,9 @@ func (this *mongoQueryBuilder[T, ID]) parseOrderByQuery(s string) (*orderByQuery
 		default:
 			// Ascending is the default when no explicit direction suffix is present
 		}
-		return o, rest, nil
+		return o, rest
 	}
-	return nil, "", NewError("IllegalArgumentError", "Could not match a valid T field for order clause")
+	return nil, ""
 }
 
 func (this *mongoQueryBuilder[T, ID]) parseWhereQuery(s string) (*whereQuery, string, Error) {
@@ -276,6 +276,19 @@ func (this *mongoQueryBuilder[T, ID]) Build(function *reflect.StructField) (*mon
 		return true
 	}
 
+	// Check if a string can be completely resolved into valid order tokens
+	canParseAsOrder := func(str string) bool {
+		s := str
+		for s != "" {
+			order, rest := this.parseOrderByQuery(s)
+			if order == nil {
+				return false
+			}
+			s = rest
+		}
+		return true
+	}
+
 	if !canParseAsConditions(predicateStr) {
 		curr := predicateStr
 		for {
@@ -285,7 +298,7 @@ func (this *mongoQueryBuilder[T, ID]) Build(function *reflect.StructField) (*mon
 			}
 			candCond := predicateStr[:idx]
 			candOrder := predicateStr[idx+7:]
-			if canParseAsConditions(candCond) && candOrder != "" {
+			if canParseAsConditions(candCond) && candOrder != "" && canParseAsOrder(candOrder) {
 				conditionStr = candCond
 				orderStr = candOrder
 				break
@@ -316,11 +329,7 @@ func (this *mongoQueryBuilder[T, ID]) Build(function *reflect.StructField) (*mon
 
 	// 5. Parse Orders
 	for orderStr != "" {
-		order, rest, err := this.parseOrderByQuery(orderStr)
-		if err != nil {
-			return nil, err
-		}
-
+		order, rest := this.parseOrderByQuery(orderStr)
 		orderStr = rest
 		this.logger.Debug("Added ordering", "field", order.field.bsonPath, "order", order.order.String())
 		query.orders = append(query.orders, order)

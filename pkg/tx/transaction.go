@@ -20,11 +20,13 @@ import (
 // It implements [context.Context] so it can be passed directly to MongoDB driver calls.
 type MongoSession struct {
 	//nolint:containedctx // Wraps mongo.SessionContext for transaction propagation
-	ctx       context.Context
-	session   mongo.Session
-	err       Error
-	committed bool
-	aborted   bool
+	ctx           context.Context
+	session       mongo.Session
+	err           Error
+	committed     bool
+	aborted       bool
+	ended         bool
+	commitPending bool
 }
 
 var _ context.Context = &MongoSession{}
@@ -81,8 +83,14 @@ func (this *MongoSession) Validate() Error {
 	if this == nil {
 		return nil
 	}
+	if this.ended {
+		return NewError("TransactionError", "Session has already ended")
+	}
 	if this.err != nil {
 		return this.err
+	}
+	if this.commitPending {
+		return NewError("TransactionError", "Transaction commit outcome is unknown and pending retry")
 	}
 	if this.aborted {
 		return NewError("TransactionError", "Transaction has already been rolled back")
@@ -112,6 +120,9 @@ func (this *MongoSession) Commit() Error {
 	if this == nil {
 		return NewError("TransactionError", "No active session")
 	}
+	if this.ended {
+		return NewError("TransactionError", "Session has already ended")
+	}
 	if this.err != nil {
 		return this.err
 	}
@@ -124,11 +135,14 @@ func (this *MongoSession) Commit() Error {
 	if err := this.session.CommitTransaction(this.ctx); err != nil {
 		wrapped := NewWrappedError("TransactionError", err)
 		if isUnknownTransactionCommitResult(err) {
+			this.commitPending = true
 			return wrapped
 		}
+		this.commitPending = false
 		this.err = wrapped
 		return this.err
 	}
+	this.commitPending = false
 	this.committed = true
 	return nil
 }
@@ -162,12 +176,15 @@ func (this *MongoSession) Abort() Error {
 	return this.Rollback()
 }
 
-// End closes the underlying [mongo.Session] if one is open.
+// End closes the underlying [mongo.Session] if one is open and marks this session wrapper as ended.
 func (this *MongoSession) End() {
-	if this != nil && this.session != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		this.session.EndSession(mongo.NewSessionContext(cleanupCtx, this.session))
+	if this != nil {
+		this.ended = true
+		if this.session != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			this.session.EndSession(mongo.NewSessionContext(cleanupCtx, this.session))
+		}
 	}
 }
 
@@ -189,6 +206,9 @@ func (this *MongoSession) Err() error {
 
 // Value implements [context.Context].
 func (this *MongoSession) Value(key any) any {
+	if key == (*MongoSession)(nil) {
+		return this
+	}
 	return this.Context().Value(key)
 }
 

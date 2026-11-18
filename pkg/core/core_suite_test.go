@@ -37,10 +37,9 @@ type Address struct {
 	Country string `bson:"country"`
 }
 
-//nolint:govet // Entity for testing
 type Animal struct {
-	ID     primitive.ObjectID `bson:"_id,omitempty"`
 	Name   string             `bson:"name"`
+	ID     primitive.ObjectID `bson:"_id,omitempty"`
 	UserID primitive.ObjectID `bson:"user_id"`
 }
 
@@ -52,16 +51,15 @@ type AnimalRepository struct {
 	MongoRepository[Animal, primitive.ObjectID]
 }
 
-//nolint:govet // Entity for testing
 type User struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty"`
+	CreatedAt time.Time          `bson:"created_at"`
+	Email     *string            `bson:"email,omitempty"`
+	Address   Address            `bson:"address"`
 	Name      string             `bson:"name"`
 	UserName  string             `bson:"user_name"`
 	Age       uint               `bson:"age"`
+	ID        primitive.ObjectID `bson:"_id,omitempty"`
 	Active    bool               `bson:"active"`
-	Email     *string            `bson:"email,omitempty"`
-	Address   Address            `bson:"address"`
-	CreatedAt time.Time          `bson:"created_at"`
 }
 
 type Foo struct{}
@@ -278,6 +276,9 @@ func (this *UserService) TransactionalChangeRollback(userID primitive.ObjectID) 
 		_, err := this.userRepository.Save(user)
 		Expect(err).NotTo(HaveOccurred())
 		writeCompleted = true
+		reRead, ok := this.userRepository.FindById(userID).Get()
+		Expect(ok).To(BeTrue())
+		Expect(reRead.Name).To(Equal("bar"))
 		return NewError("TransactionalError", "Rolling back")
 	})
 
@@ -304,6 +305,9 @@ func (this *UserService) TransactionalChangeRollbackPprof(userID primitive.Objec
 			_, err := this.userRepository.Save(user)
 			Expect(err).NotTo(HaveOccurred())
 			writeCompleted = true
+			reRead, ok := this.userRepository.FindById(userID).Get()
+			Expect(ok).To(BeTrue())
+			Expect(reRead.Name).To(Equal("bar-pprof"))
 		})
 		return NewError("TransactionalError", "Rolling back inside pprof")
 	})

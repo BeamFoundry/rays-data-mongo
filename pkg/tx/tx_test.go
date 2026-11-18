@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -34,11 +36,25 @@ func (e *customLabeledError) HasErrorLabel(label string) bool {
 
 type mockCommitErrSession struct {
 	mongo.Session
-	commitErr error
+	commitErr   error
+	commitCalls int
 }
 
 func (m *mockCommitErrSession) CommitTransaction(context.Context) error {
+	m.commitCalls++
 	return m.commitErr
+}
+
+type recordingLogSink struct {
+	messages []string
+}
+
+func (r *recordingLogSink) Info(_ int, msg string, _ ...any) {
+	r.messages = append(r.messages, msg)
+}
+
+func (r *recordingLogSink) Error(_ error, msg string, _ ...any) {
+	r.messages = append(r.messages, msg)
 }
 
 type dummyLogSink struct{}
@@ -89,6 +105,11 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		mongoPort = int(port.Num())
 		mongoURI, err = mongodbContainer.ConnectionString(ctx)
 		Expect(err).NotTo(HaveOccurred())
+		if strings.Contains(mongoURI, "?") {
+			mongoURI += "&directConnection=true"
+		} else {
+			mongoURI += "?directConnection=true"
+		}
 	})
 
 	AfterAll(func() {
@@ -168,6 +189,13 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		Expect(*optsURI.ConnectTimeout).To(Equal(2500 * time.Millisecond))
 		Expect(NewMongoClientBuilder().ExportResolvedConnectTimeout(&options.ClientOptions{})).To(Equal(10 * time.Second))
 
+		// Zero connect timeout boundary test
+		zeroDuration := time.Duration(0)
+		Expect(NewMongoClientBuilder().ExportResolvedConnectTimeout(&options.ClientOptions{ConnectTimeout: &zeroDuration})).To(Equal(time.Duration(0)))
+		cZero, errZero := NewMongoClientBuilder().WithURI(mongoURI).WithConnectTimeout(0).Build()
+		Expect(errZero).NotTo(HaveOccurred())
+		Expect(cZero.Disconnect(context.Background())).NotTo(HaveOccurred())
+
 		// Build with custom context
 		customCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -184,11 +212,45 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		_, err = NewMongoClientBuilder().WithURI("://invalid-uri").BuildDatabase("bad")
 		Expect(err).To(HaveOccurred())
 
+		// Command logging suppression test with MONGODB_LOG_COMMAND and MONGODB_LOG_ALL set in environment
+		Expect(os.Setenv("MONGODB_LOG_COMMAND", "debug")).To(Succeed())
+		defer func() {
+			Expect(os.Unsetenv("MONGODB_LOG_COMMAND")).To(Succeed())
+		}()
+		Expect(os.Setenv("MONGODB_LOG_ALL", "debug")).To(Succeed())
+		defer func() {
+			Expect(os.Unsetenv("MONGODB_LOG_ALL")).To(Succeed())
+		}()
+
+		recSink := &recordingLogSink{}
+		cNoCmd, err := NewMongoClientBuilder().
+			WithURI(mongoURI).
+			WithLogSink(recSink).
+			WithCommandLogging(false).
+			Build()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cNoCmd.Database("test_tx_db").RunCommand(context.Background(), bson.D{{Key: "ping", Value: 1}}).Err()).NotTo(HaveOccurred())
+		Expect(cNoCmd.Disconnect(context.Background())).NotTo(HaveOccurred())
+
+		for _, msg := range recSink.messages {
+			Expect(strings.Contains(msg, "Command started")).To(BeFalse())
+			Expect(strings.Contains(msg, "Command succeeded")).To(BeFalse())
+		}
+
+		Expect(NewMongoClientBuilder().ExportResolvedConnectTimeout(nil)).To(Equal(10 * time.Second))
+
 		// Ping failure and disconnect cleanup
 		unreachableURI := "mongodb://127.0.0.1:1/?directConnection=true&serverSelectionTimeoutMS=50"
 		_, err = NewMongoClientBuilder().
 			WithURI(unreachableURI).
 			WithConnectTimeout(50 * time.Millisecond).
+			Build()
+		Expect(err).To(HaveOccurred())
+
+		// Ping failure with zero connect timeout (covers no-timeout disconnect cleanup)
+		_, err = NewMongoClientBuilder().
+			WithURI(unreachableURI).
+			WithConnectTimeout(0).
 			Build()
 		Expect(err).To(HaveOccurred())
 	})
@@ -240,6 +302,15 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		Expect(sCtx.Done()).NotTo(BeNil())
 		Expect(sCtx.Err()).NotTo(HaveOccurred())
 		Expect(sCtx.Value(testKey)).To(Equal("testVal"))
+		Expect(sCtx.Value((*MongoSession)(nil))).To(Equal(sCtx))
+
+		// Ended session methods return error
+		endedSess := NewMongoSession(context.Background(), nil)
+		endedSess.End()
+		Expect(endedSess.Validate()).To(HaveOccurred())
+		Expect(endedSess.Commit()).To(HaveOccurred())
+		Expect(endedSess.Rollback()).To(HaveOccurred())
+		Expect(endedSess.Abort()).To(HaveOccurred())
 
 		// Session with driver session
 		driverSess, err := client.StartSession()
@@ -282,7 +353,12 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		mockSess := &mockCommitErrSession{Session: rawSess, commitErr: errors.New("UnknownTransactionCommitResult")}
 		msMock := NewMongoSession(context.Background(), mockSess)
 		Expect(msMock.Commit()).To(HaveOccurred())
+		Expect(mockSess.commitCalls).To(Equal(1))
+		Expect(msMock.Validate()).To(HaveOccurred()) // commitPending is true
 		Expect(msMock.Error()).NotTo(HaveOccurred()) // Not cached, retry allowed
+		mockSess.commitErr = nil
+		Expect(msMock.Commit()).NotTo(HaveOccurred()) // Retry succeeds
+		Expect(mockSess.commitCalls).To(Equal(2))
 		msMock.End()
 
 		// Mock session with terminal non-retryable error (cached)
@@ -291,8 +367,10 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		mockSessTerminal := &mockCommitErrSession{Session: rawSess2, commitErr: errors.New("terminal commit error")}
 		msMockTerminal := NewMongoSession(context.Background(), mockSessTerminal)
 		Expect(msMockTerminal.Commit()).To(HaveOccurred())
+		Expect(mockSessTerminal.commitCalls).To(Equal(1))
 		Expect(msMockTerminal.Error()).To(HaveOccurred())  // Cached
 		Expect(msMockTerminal.Commit()).To(HaveOccurred()) // Returns cached error
+		Expect(mockSessTerminal.commitCalls).To(Equal(1))  // Terminal error does not call mock on second Commit
 		msMockTerminal.End()
 
 		// Session with initial error
@@ -351,8 +429,12 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 			})
 		}).To(Panic())
 
-		// Verify neither rolled-back doc persisted
+		// Verify neither rolled-back doc persisted, and successful doc persisted
 		coll := client.Database("test_tx_db").Collection("docs")
+		countSuccess, countSuccessErr := coll.CountDocuments(context.Background(), bson.M{"msg": "success_tx"})
+		Expect(countSuccessErr).NotTo(HaveOccurred())
+		Expect(countSuccess).To(Equal(int64(1)))
+
 		count, countErr := coll.CountDocuments(context.Background(), bson.M{"msg": "rollback_tx"})
 		Expect(countErr).NotTo(HaveOccurred())
 		Expect(count).To(Equal(int64(0)))

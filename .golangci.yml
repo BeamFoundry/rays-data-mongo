@@ -1,7 +1,6 @@
-# Note: `version: "2"` specifies the golangci-lint YAML configuration schema format,
-# not the executable version. Running `make test` requires golangci-lint v2.0.0+
-# (tested with v2.15.0+ / Go 1.24+ / Go 1.27) to support the v2 schema and the nested
-# formatters/gofumpt options.
+# Note: `version: "2"` specifies the golangci-lint YAML configuration schema format.
+# Running `make test` requires golangci-lint v2.15.0+ as the tested minimum that supports
+# Go 1.27 and the v2 configuration schema.
 version: "2"
 run:
   modules-download-mode: readonly
