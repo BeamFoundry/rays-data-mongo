@@ -5,6 +5,7 @@ import (
 	"reflect"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 
 	. "github.com/BeamFoundry/rays/pkg/lang"
 )
@@ -36,7 +37,7 @@ func ExportFitsNumericRange(val reflect.Value, targetType reflect.Type) bool {
 
 // ExportEntityIDStatus exposes entityIDStatus for testing.
 func ExportEntityIDStatus(object any) (val any, hasEncoded bool, err error) {
-	st, encodeErr := entityIDStatus(object)
+	st, encodeErr := entityIDStatus(nil, object)
 	if encodeErr != nil {
 		return nil, false, encodeErr
 	}
@@ -46,4 +47,9 @@ func ExportEntityIDStatus(object any) (val any, hasEncoded bool, err error) {
 // ExportAssignGeneratedID exposes assignGeneratedID for testing.
 func ExportAssignGeneratedID(idField reflect.Value) bool {
 	return assignGeneratedID(idField)
+}
+
+// ExportMarshalWithCollection exposes marshalWithCollection for testing.
+func ExportMarshalWithCollection(coll *mongo.Collection, val any) ([]byte, error) {
+	return marshalWithCollection(coll, val)
 }

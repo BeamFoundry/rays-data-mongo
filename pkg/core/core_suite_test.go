@@ -145,6 +145,8 @@ type UserRepository struct {
 }
 
 func (this *UserRepository) PostConstruct() Error {
+	// Verify that PostConstruct initializes the parser function before it can be called
+	_ = this.findByName("preflight_init_check")
 	_, err := this.EnsureIndexes(context.Background(), mongo.IndexModel{
 		Keys: bson.D{{Key: "user_name", Value: 1}},
 	})

@@ -162,27 +162,38 @@ func isNestedDocumentStruct(t reflect.Type) bool {
 	return true
 }
 
-func (this *mongoQueryBuilder[T, ID]) parseOrderByQuery(s string) (query *orderByQuery, rest string) {
-	o := &orderByQuery{
-		order: orderSortings.ASC,
+func (this *mongoQueryBuilder[T, ID]) canParseAsOrder(str string) bool {
+	s := str
+	for s != "" {
+		order, rest := this.parseOrderByQuery(s)
+		if order == nil {
+			return false
+		}
+		s = rest
 	}
+	return true
+}
 
+func (this *mongoQueryBuilder[T, ID]) parseOrderByQuery(s string) (query *orderByQuery, rest string) {
 	for _, field := range this.fields {
 		if !String(s).StartsWith(field.camelName) {
 			continue
 		}
-		rest := s[len(field.camelName):]
-		o.field = field
-		switch {
-		case String(rest).StartsWith("Asc"):
-			rest = rest[3:]
-		case String(rest).StartsWith("Desc"):
-			rest = rest[4:]
-			o.order = orderSortings.DESC
-		default:
-			// Ascending is the default when no explicit direction suffix is present
+		afterField := s[len(field.camelName):]
+		if String(afterField).StartsWith("Asc") {
+			rem := afterField[3:]
+			if rem == "" || this.canParseAsOrder(rem) {
+				return &orderByQuery{field: field, order: orderSortings.ASC}, rem
+			}
+		} else if String(afterField).StartsWith("Desc") {
+			rem := afterField[4:]
+			if rem == "" || this.canParseAsOrder(rem) {
+				return &orderByQuery{field: field, order: orderSortings.DESC}, rem
+			}
 		}
-		return o, rest
+		if afterField == "" || this.canParseAsOrder(afterField) {
+			return &orderByQuery{field: field, order: orderSortings.ASC}, afterField
+		}
 	}
 	return nil, ""
 }
@@ -276,19 +287,6 @@ func (this *mongoQueryBuilder[T, ID]) Build(function *reflect.StructField) (*mon
 		return true
 	}
 
-	// Check if a string can be completely resolved into valid order tokens
-	canParseAsOrder := func(str string) bool {
-		s := str
-		for s != "" {
-			order, rest := this.parseOrderByQuery(s)
-			if order == nil {
-				return false
-			}
-			s = rest
-		}
-		return true
-	}
-
 	if !canParseAsConditions(predicateStr) {
 		curr := predicateStr
 		for {
@@ -298,7 +296,7 @@ func (this *mongoQueryBuilder[T, ID]) Build(function *reflect.StructField) (*mon
 			}
 			candCond := predicateStr[:idx]
 			candOrder := predicateStr[idx+7:]
-			if canParseAsConditions(candCond) && candOrder != "" && canParseAsOrder(candOrder) {
+			if canParseAsConditions(candCond) && candOrder != "" && this.canParseAsOrder(candOrder) {
 				conditionStr = candCond
 				orderStr = candOrder
 				break

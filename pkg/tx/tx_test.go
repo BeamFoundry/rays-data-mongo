@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -213,14 +212,8 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		Expect(err).To(HaveOccurred())
 
 		// Command logging suppression test with MONGODB_LOG_COMMAND and MONGODB_LOG_ALL set in environment
-		Expect(os.Setenv("MONGODB_LOG_COMMAND", "debug")).To(Succeed())
-		defer func() {
-			Expect(os.Unsetenv("MONGODB_LOG_COMMAND")).To(Succeed())
-		}()
-		Expect(os.Setenv("MONGODB_LOG_ALL", "debug")).To(Succeed())
-		defer func() {
-			Expect(os.Unsetenv("MONGODB_LOG_ALL")).To(Succeed())
-		}()
+		GinkgoT().Setenv("MONGODB_LOG_COMMAND", "debug")
+		GinkgoT().Setenv("MONGODB_LOG_ALL", "debug")
 
 		recSink := &recordingLogSink{}
 		cNoCmd, err := NewMongoClientBuilder().

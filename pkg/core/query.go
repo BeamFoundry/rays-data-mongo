@@ -137,9 +137,7 @@ func (this *MongoQuery) WithContext(ctx context.Context) *MongoQuery {
 	q := this.clone()
 	if ctx != nil {
 		q.ctx = ctx
-		if v := extractValidator(ctx); v != nil {
-			q.validator = v
-		}
+		q.validator = extractValidator(ctx)
 	}
 	return q
 }
@@ -191,6 +189,9 @@ func (this *MongoQuery) Where(filter any) *MongoQuery {
 	if filter == nil {
 		return this
 	}
+	if d, ok := filter.(bson.D); ok && d == nil {
+		filter = bson.D{}
+	}
 	q := this.clone()
 	q.andFilters = append(q.andFilters, copyFilter(filter))
 	return q
@@ -204,17 +205,25 @@ func (this *MongoQuery) Or(filters ...any) *MongoQuery {
 		return this
 	}
 	q := this.clone()
-	if len(filters) == 1 && len(q.andFilters) > 0 {
+	normFilters := make([]any, len(filters))
+	for i, f := range filters {
+		if d, ok := f.(bson.D); ok && d == nil {
+			normFilters[i] = bson.D{}
+		} else {
+			normFilters[i] = f
+		}
+	}
+	if len(normFilters) == 1 && len(q.andFilters) > 0 {
 		existing := q.Filter()
-		q.andFilters = []any{bson.M{bsonOpOr: bson.A{existing, copyFilter(filters[0])}}}
+		q.andFilters = []any{bson.M{bsonOpOr: bson.A{existing, copyFilter(normFilters[0])}}}
 		return q
 	}
-	if len(filters) == 1 {
-		q.andFilters = append(q.andFilters, copyFilter(filters[0]))
+	if len(normFilters) == 1 {
+		q.andFilters = append(q.andFilters, copyFilter(normFilters[0]))
 		return q
 	}
-	orSlice := make(bson.A, 0, len(filters))
-	for _, f := range filters {
+	orSlice := make(bson.A, 0, len(normFilters))
+	for _, f := range normFilters {
 		orSlice = append(orSlice, copyFilter(f))
 	}
 	q.andFilters = append(q.andFilters, bson.M{bsonOpOr: orSlice})
@@ -764,7 +773,8 @@ func fitsNumericRange(val reflect.Value, targetType reflect.Type) bool {
 		case reflect.Int32:
 			return f >= math.MinInt32 && f <= math.MaxInt32
 		case reflect.Int:
-			return f >= float64(math.MinInt) && f < 9223372036854775808.0
+			upper := math.Pow(2, float64(targetType.Bits()-1))
+			return f >= -upper && f < upper
 		case reflect.Int64:
 			return f >= math.MinInt64 && f < 9223372036854775808.0
 		case reflect.Uint8:
@@ -773,7 +783,9 @@ func fitsNumericRange(val reflect.Value, targetType reflect.Type) bool {
 			return f >= 0 && f <= math.MaxUint16
 		case reflect.Uint32:
 			return f >= 0 && f <= math.MaxUint32
-		case reflect.Uint, reflect.Uint64:
+		case reflect.Uint:
+			return f >= 0 && f < math.Pow(2, float64(targetType.Bits()))
+		case reflect.Uint64:
 			return f >= 0 && f < 18446744073709551616.0
 		case reflect.Float32:
 			return f >= -math.MaxFloat32 && f <= math.MaxFloat32
@@ -922,6 +934,16 @@ func copyFilter(val any) any {
 				outMap.SetMapIndex(iter.Key(), valToSet)
 			}
 			return outMap.Interface()
+		case reflect.Pointer:
+			if rv.IsNil() {
+				return val
+			}
+			newPtr := reflect.New(rv.Type().Elem())
+			copiedElem := copyFilter(rv.Elem().Interface())
+			if copiedElem != nil {
+				newPtr.Elem().Set(reflect.ValueOf(copiedElem))
+			}
+			return newPtr.Interface()
 		default:
 			return val
 		}

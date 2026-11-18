@@ -1,11 +1,14 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"reflect"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsoncodec"
+	"go.mongodb.org/mongo-driver/bson/bsonrw"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -121,6 +124,9 @@ func pluralize(word string) string {
 
 // Collection returns the underlying [*mongo.Collection] for entity T.
 func (this *MongoRepository[T, K]) Collection() *mongo.Collection {
+	if this.database == nil {
+		return nil
+	}
 	return this.database.Collection(this.resolveCollectionName())
 }
 
@@ -185,14 +191,18 @@ func (this *MongoRepository[T, K]) Delete(object *T) Error {
 	if err != nil {
 		return err
 	}
-	st, encodeErr := entityIDStatus(object)
+	coll := this.Collection()
+	st, encodeErr := entityIDStatus(coll, object)
 	if encodeErr != nil {
 		return encodeErr
 	}
 	if !st.hasEncoded {
 		return NewError("IllegalArgumentError", "Entity does not have a non-zero _id field; use DeleteById with the actual key")
 	}
-	if _, driverErr := this.Collection().DeleteOne(ctx, bson.M{bsonIDField: st.val}); driverErr != nil {
+	if coll == nil {
+		return NewError("MongoConfigurationError", "Database is not configured for repository")
+	}
+	if _, driverErr := coll.DeleteOne(ctx, bson.M{bsonIDField: st.val}); driverErr != nil {
 		return NewWrappedError("MongoError", driverErr)
 	}
 	return nil
@@ -204,7 +214,11 @@ func (this *MongoRepository[T, K]) DeleteById(id K) Error {
 	if err != nil {
 		return err
 	}
-	if _, driverErr := this.Collection().DeleteOne(ctx, bson.M{bsonIDField: id}); driverErr != nil {
+	coll := this.Collection()
+	if coll == nil {
+		return NewError("MongoConfigurationError", "Database is not configured for repository")
+	}
+	if _, driverErr := coll.DeleteOne(ctx, bson.M{bsonIDField: id}); driverErr != nil {
 		return NewWrappedError("MongoError", driverErr)
 	}
 	return nil
@@ -222,14 +236,17 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	}
 
 	coll := this.Collection()
-	st, encodeErr := entityIDStatus(object)
+	if coll == nil {
+		return nil, NewError("MongoConfigurationError", "Database is not configured for repository")
+	}
+	st, encodeErr := entityIDStatus(coll, object)
 	if encodeErr != nil {
 		return nil, encodeErr
 	}
 
 	if st.hasEncoded {
 		opts := options.Replace().SetUpsert(true)
-		if _, driverErr := coll.ReplaceOne(ctx, bson.M{bsonIDField: st.val}, object, opts); driverErr != nil {
+		if _, driverErr := coll.ReplaceOne(ctx, bson.M{bsonIDField: st.val}, bson.Raw(st.docBytes), opts); driverErr != nil {
 			return nil, NewWrappedError("MongoError", driverErr)
 		}
 		return object, nil
@@ -260,19 +277,23 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 		return nil, err
 	}
 
+	coll := this.Collection()
+	if coll == nil {
+		return nil, NewError("MongoConfigurationError", "Database is not configured for repository")
+	}
 	models := make([]mongo.WriteModel, 0, len(objects))
 	for _, object := range objects {
 		if object == nil {
 			return nil, NewError("IllegalArgumentError", "Cannot save nil entity in SaveAll")
 		}
-		st, encodeErr := entityIDStatus(object)
+		st, encodeErr := entityIDStatus(coll, object)
 		if encodeErr != nil {
 			return nil, encodeErr
 		}
 		if st.hasEncoded {
 			models = append(models, mongo.NewReplaceOneModel().
 				SetFilter(bson.M{bsonIDField: st.val}).
-				SetReplacement(object).
+				SetReplacement(bson.Raw(st.docBytes)).
 				SetUpsert(true))
 		} else {
 			if !assignGeneratedID(st.field) {
@@ -282,7 +303,7 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 		}
 	}
 
-	if _, driverErr := this.Collection().BulkWrite(ctx, models); driverErr != nil {
+	if _, driverErr := coll.BulkWrite(ctx, models); driverErr != nil {
 		return nil, NewWrappedError("MongoError", driverErr)
 	}
 	return objects, nil
@@ -302,7 +323,11 @@ func (this *MongoRepository[T, K]) EnsureIndexes(ctx context.Context, models ...
 	if execCtx == nil {
 		execCtx = activeCtx
 	}
-	names, err := this.Collection().Indexes().CreateMany(execCtx, models)
+	coll := this.Collection()
+	if coll == nil {
+		return nil, NewError("MongoConfigurationError", "Database is not configured for repository")
+	}
+	names, err := coll.Indexes().CreateMany(execCtx, models)
 	if err != nil {
 		return nil, NewWrappedError("MongoError", err)
 	}
@@ -376,46 +401,111 @@ func findIDField(v reflect.Value) reflect.Value {
 type idStatus struct {
 	val        any
 	field      reflect.Value
+	docBytes   []byte
 	hasEncoded bool
 }
 
-func entityIDStatus(object any) (idStatus, Error) {
+//nolint:wrapcheck,errcheck // Internal helper propagating BSON encoding errors; ValueWriter and Encoder constructors are infallible
+func marshalWithCollection(coll *mongo.Collection, val any) ([]byte, error) {
+	if coll == nil {
+		return bson.Marshal(val)
+	}
+	cv := reflect.ValueOf(coll).Elem()
+	regField := cv.FieldByName("registry")
+	optsField := cv.FieldByName("bsonOpts")
+
+	var reg *bsoncodec.Registry
+	if regField.IsValid() {
+		regVal := UnprotectValue(regField)
+		if r, ok := regVal.Interface().(*bsoncodec.Registry); ok {
+			reg = r
+		}
+	}
+
+	var opts *options.BSONOptions
+	if optsField.IsValid() {
+		optsVal := UnprotectValue(optsField)
+		if o, ok := optsVal.Interface().(*options.BSONOptions); ok {
+			opts = o
+		}
+	}
+
+	if reg == nil && opts == nil {
+		return bson.Marshal(val)
+	}
+
+	buf := new(bytes.Buffer)
+	vw, _ := bsonrw.NewBSONValueWriter(buf)
+	enc, _ := bson.NewEncoder(vw)
+	if opts != nil {
+		if opts.UseJSONStructTags {
+			enc.UseJSONStructTags()
+		}
+		if opts.ErrorOnInlineDuplicates {
+			enc.ErrorOnInlineDuplicates()
+		}
+		if opts.IntMinSize {
+			enc.IntMinSize()
+		}
+		if opts.NilMapAsEmpty {
+			enc.NilMapAsEmpty()
+		}
+		if opts.NilSliceAsEmpty {
+			enc.NilSliceAsEmpty()
+		}
+		if opts.NilByteSliceAsEmpty {
+			enc.NilByteSliceAsEmpty()
+		}
+		if opts.OmitZeroStruct {
+			enc.OmitZeroStruct()
+		}
+		if opts.StringifyMapKeysWithFmt {
+			enc.StringifyMapKeysWithFmt()
+		}
+	}
+	if reg != nil {
+		_ = enc.SetRegistry(reg)
+	}
+	if err := enc.Encode(val); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func entityIDStatus(coll *mongo.Collection, object any) (idStatus, Error) {
 	if object == nil {
 		return idStatus{}, nil
 	}
 	idField := findIDField(reflect.ValueOf(object))
-	if !idField.IsValid() {
-		return idStatus{}, nil
-	}
 
-	rawBytes, err := bson.Marshal(object)
+	rawBytes, err := marshalWithCollection(coll, object)
 	if err != nil {
 		return idStatus{field: idField}, NewWrappedError("MongoError", err)
 	}
 	rawVal, err := bson.Raw(rawBytes).LookupErr(bsonIDField)
 	if err != nil {
 		//nolint:nilerr // Missing _id field in serialized BSON is expected when omitted
-		return idStatus{field: idField}, nil
+		return idStatus{field: idField, docBytes: rawBytes}, nil
 	}
 
 	if rawVal.Type == bson.TypeNull {
-		if idField.Kind() == reflect.Pointer && idField.Type().Elem() == objectIDType && idField.IsNil() {
-			return idStatus{field: idField}, nil
+		if idField.IsValid() && idField.Kind() == reflect.Pointer && idField.Type().Elem() == objectIDType && idField.IsNil() {
+			return idStatus{field: idField, docBytes: rawBytes}, nil
 		}
 	}
 
 	if rawVal.Type == bson.TypeObjectID {
 		oid := rawVal.ObjectID()
 		if oid.IsZero() {
-			return idStatus{field: idField}, nil
+			return idStatus{field: idField, docBytes: rawBytes}, nil
 		}
-		return idStatus{field: idField, val: oid, hasEncoded: true}, nil
+		return idStatus{field: idField, val: oid, docBytes: rawBytes, hasEncoded: true}, nil
 	}
 
 	var decodedID any
 	//nolint:errcheck // Unmarshaling valid BSON raw value into any cannot fail
 	_ = rawVal.Unmarshal(&decodedID)
-	return idStatus{field: idField, val: decodedID, hasEncoded: true}, nil
+	return idStatus{field: idField, val: decodedID, docBytes: rawBytes, hasEncoded: true}, nil
 }
 
 func assignGeneratedID(idField reflect.Value) bool {

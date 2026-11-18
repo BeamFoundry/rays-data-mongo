@@ -235,6 +235,26 @@ type TeamOrderRepo struct {
 	MongoRepository[TeamOrderEntity, primitive.ObjectID]
 }
 
+type InlineMapEntity struct {
+	Data map[string]any `bson:",inline"`
+}
+
+type InlineMapRepo struct {
+	MongoRepository[InlineMapEntity, string]
+}
+
+type DescEntity struct {
+	Name        string             `bson:"name"`
+	Description string             `bson:"description"`
+	ID          primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+type DescRepo struct {
+	FindByNameOrderByDescriptionAsc     func(string) []DescEntity
+	FindByDescriptionOrderByDescription func(string) []DescEntity
+	MongoRepository[DescEntity, primitive.ObjectID]
+}
+
 type errBSONMarshaler struct{}
 
 func (e errBSONMarshaler) MarshalBSON() ([]byte, error) {
@@ -565,6 +585,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			teamRepo       *TeamOrderRepo
 			badMarshalRepo *BadMarshalRepo
 			nilOIDRepo     *NilOIDRepo
+			inlineMapRepo  *InlineMapRepo
+			descRepo       *DescRepo
 			txMgr          MongoTransactional
 			db             *mongo.Database
 			client         *mongo.Client
@@ -591,6 +613,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			teamRepo = &TeamOrderRepo{}
 			badMarshalRepo = &BadMarshalRepo{}
 			nilOIDRepo = &NilOIDRepo{}
+			inlineMapRepo = &InlineMapRepo{}
+			descRepo = &DescRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
@@ -616,6 +640,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(teamRepo)
 			AddBeamFor(badMarshalRepo)
 			AddBeamFor(nilOIDRepo)
+			AddBeamFor(inlineMapRepo)
+			AddBeamFor(descRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -1012,13 +1038,21 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(anonRepo.Collection().Name()).To(Equal("documents"))
 			Expect(ptrEntRepo.Collection().Name()).To(Equal("users"))
 
-			// Standalone repository without transactionManager
+			// Standalone repository without transactionManager or database
 			standaloneRepo := &MongoRepository[User, primitive.ObjectID]{}
 			Expect(standaloneRepo.Query()).NotTo(BeNil())
 			Expect(standaloneRepo.Delete(&User{})).To(HaveOccurred())
+			Expect(standaloneRepo.Delete(&User{ID: primitive.NewObjectID()})).To(HaveOccurred())
+			Expect(standaloneRepo.DeleteById(primitive.NewObjectID())).To(HaveOccurred())
+			_, err = standaloneRepo.Save(&User{ID: primitive.NewObjectID()})
+			Expect(err).To(HaveOccurred())
+			_, err = standaloneRepo.SaveAll([]*User{{ID: primitive.NewObjectID()}})
+			Expect(err).To(HaveOccurred())
 			//nolint:staticcheck // Intentionally testing nil context fallback
 			_, err = standaloneRepo.EnsureIndexes(nil)
 			Expect(err).NotTo(HaveOccurred())
+			_, err = standaloneRepo.EnsureIndexes(context.Background(), mongo.IndexModel{Keys: bson.D{{Key: "name", Value: 1}}})
+			Expect(err).To(HaveOccurred())
 
 			// Save(nil), SaveAll(empty), SaveAll(with nil)
 			_, err = userRepo.Save(nil)
@@ -1100,10 +1134,16 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			// Derived context query execution before commit/rollback succeeds
 			derivedCtx, derivedCancel := context.WithTimeout(sess, 5*time.Second)
 			defer derivedCancel()
-			qDerived := userRepo.Query().WithContext(derivedCtx).Where(bson.M{"name": "seeded_for_qpre"})
+			qDerived := NewMongoQuery(context.Background(), db, userRepo.Collection().Name()).
+				WithContext(derivedCtx).
+				Where(bson.M{"name": "seeded_for_qpre"})
 			var singleUserDerived User
 			Expect(qDerived.First(&singleUserDerived)).NotTo(HaveOccurred())
 			Expect(singleUserDerived.Name).To(Equal("seeded_for_qpre"))
+
+			// WithContext with non-nil context without session clears previously cached validator
+			qCleared := qDerived.WithContext(context.Background())
+			Expect(qCleared.Error()).NotTo(HaveOccurred())
 
 			Expect(sess.Rollback()).NotTo(HaveOccurred())
 			Expect(userRepo.FindById(primitive.NewObjectID()).IsPresent()).To(BeFalse())
@@ -1133,6 +1173,10 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(derivedDelErr).To(HaveOccurred())
 			Expect(derivedDelErr.Name()).To(Equal("TransactionError"))
 			Expect(derivedCount).To(Equal(int64(0)))
+
+			// Cleared query context without session executes outside transaction and succeeds after rollback
+			Expect(qCleared.First(&singleUserAfter)).NotTo(HaveOccurred())
+			Expect(singleUserAfter.Name).To(Equal("seeded_for_qpre"))
 
 			// Direct MongoQuery execution after rollback must fail with TransactionError before calling driver
 			Expect(userRepo.Query().First(&singleUser)).To(HaveOccurred())
@@ -1523,6 +1567,134 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(ok).To(BeTrue())
 			Expect(foundNilDoc.Name).To(Equal("generated_id_entity"))
 			Expect(nilOIDRepo.Delete(savedNilDoc)).NotTo(HaveOccurred())
+
+			// 15. Pointer snapshotting in copyFilter: mutating original or Filter() return does not alter query predicate
+			ptrVal := "initial_val"
+			qPtr := userRepo.Query().Where(bson.M{"name": &ptrVal})
+			ptrVal = "mutated_original"
+			filterMap1, ok := qPtr.Filter().(bson.M)
+			Expect(ok).To(BeTrue())
+			retVal1, ok := filterMap1["name"].(*string)
+			Expect(ok).To(BeTrue())
+			Expect(*retVal1).To(Equal("initial_val"))
+
+			*retVal1 = "mutated_filter_return"
+			filterMap2, ok := qPtr.Filter().(bson.M)
+			Expect(ok).To(BeTrue())
+			retVal2, ok := filterMap2["name"].(*string)
+			Expect(ok).To(BeTrue())
+			Expect(*retVal2).To(Equal("initial_val"))
+
+			var nilStrPtr *string
+			Expect(ExportCopyFilter(nilStrPtr)).To(BeNil())
+
+			// 16. Normalize typed nil top-level bson.D filters to empty documents in Where and Or
+			var nilD bson.D
+			qWhereNilD := userRepo.Query().Where(nilD)
+			Expect(qWhereNilD.Filter()).To(Equal(bson.D{}))
+			_, marshalErr := bson.Marshal(qWhereNilD.Filter())
+			Expect(marshalErr).NotTo(HaveOccurred())
+
+			qOrSingleNilD := userRepo.Query().Or(nilD)
+			Expect(qOrSingleNilD.Filter()).To(Equal(bson.D{}))
+			_, marshalErr = bson.Marshal(qOrSingleNilD.Filter())
+			Expect(marshalErr).NotTo(HaveOccurred())
+
+			qOrMultiNilD := userRepo.Query().Or(nilD, bson.D{{Key: "name", Value: "test"}})
+			_, marshalErr = bson.Marshal(qOrMultiNilD.Filter())
+			Expect(marshalErr).NotTo(HaveOccurred())
+
+			nestedFilter := bson.D{{Key: "nested", Value: nilD}}
+			qNested := userRepo.Query().Where(nestedFilter)
+			nestedRet, ok := qNested.Filter().(bson.D)
+			Expect(ok).To(BeTrue())
+			Expect(nestedRet[0].Value).To(Equal(bson.D(nil)))
+
+			// 17. Numeric range checks with targetType.Bits()
+			intType := reflect.TypeFor[int]()
+			uintType := reflect.TypeFor[uint]()
+			int64Type := reflect.TypeFor[int64]()
+			uint64Type := reflect.TypeFor[uint64]()
+
+			maxIntBound := math.Pow(2, float64(intType.Bits()-1))
+			Expect(ExportFitsNumericRange(reflect.ValueOf(maxIntBound/2), intType)).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(maxIntBound), intType)).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(-maxIntBound), intType)).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(-maxIntBound*2), intType)).To(BeFalse())
+
+			maxUintBound := math.Pow(2, float64(uintType.Bits()))
+			Expect(ExportFitsNumericRange(reflect.ValueOf(maxUintBound/2), uintType)).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(maxUintBound), uintType)).To(BeFalse())
+
+			Expect(ExportFitsNumericRange(reflect.ValueOf(9223372036854775808.0/2), int64Type)).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(9223372036854775808.0), int64Type)).To(BeFalse())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(18446744073709551616.0/2), uint64Type)).To(BeTrue())
+			Expect(ExportFitsNumericRange(reflect.ValueOf(18446744073709551616.0), uint64Type)).To(BeFalse())
+
+			// 18. Inline map entity with _id in Save, FindById, SaveAll, Delete
+			inlineDoc := &InlineMapEntity{
+				Data: map[string]any{"_id": "inline_01", "name": "inline_test"},
+			}
+			savedInline, inlineSaveErr := inlineMapRepo.Save(inlineDoc)
+			Expect(inlineSaveErr).NotTo(HaveOccurred())
+			Expect(savedInline).NotTo(BeNil())
+
+			foundInline, ok := inlineMapRepo.FindById("inline_01").Get()
+			Expect(ok).To(BeTrue())
+			Expect(foundInline.Data["name"]).To(Equal("inline_test"))
+
+			inlineDoc.Data["name"] = "inline_updated"
+			_, inlineSaveAllErr := inlineMapRepo.SaveAll([]*InlineMapEntity{inlineDoc})
+			Expect(inlineSaveAllErr).NotTo(HaveOccurred())
+
+			foundInline2, ok := inlineMapRepo.FindById("inline_01").Get()
+			Expect(ok).To(BeTrue())
+			Expect(foundInline2.Data["name"]).To(Equal("inline_updated"))
+
+			Expect(inlineMapRepo.Delete(inlineDoc)).NotTo(HaveOccurred())
+			Expect(inlineMapRepo.FindById("inline_01").IsPresent()).To(BeFalse())
+
+			inlineNoIDDoc := &InlineMapEntity{Data: map[string]any{"name": "no_id"}}
+			Expect(inlineMapRepo.Delete(inlineNoIDDoc)).To(HaveOccurred())
+
+			// 19. Sort parsing fallback to implicit direction
+			descDoc := &DescEntity{Name: "item1", Description: "desc1"}
+			_, err = descRepo.Save(descDoc)
+			Expect(err).NotTo(HaveOccurred())
+
+			foundDescs := descRepo.FindByNameOrderByDescriptionAsc("item1")
+			Expect(foundDescs).To(HaveLen(1))
+			Expect(foundDescs[0].Description).To(Equal("desc1"))
+
+			foundDescs2 := descRepo.FindByDescriptionOrderByDescription("desc1")
+			Expect(foundDescs2).To(HaveLen(1))
+			Expect(descRepo.Delete(descDoc)).NotTo(HaveOccurred())
+
+			// 20. marshalWithCollection with nil collection, empty collection without registry/opts, and custom collection with BSONOptions & registry
+			nilCollBytes, mErr := ExportMarshalWithCollection(nil, bson.M{"a": 1})
+			Expect(mErr).NotTo(HaveOccurred())
+			Expect(nilCollBytes).NotTo(BeEmpty())
+
+			emptyCollBytes, mErr := ExportMarshalWithCollection(&mongo.Collection{}, bson.M{"a": 1})
+			Expect(mErr).NotTo(HaveOccurred())
+			Expect(emptyCollBytes).NotTo(BeEmpty())
+
+			customCollOpts := options.Collection().
+				SetBSONOptions(&options.BSONOptions{
+					UseJSONStructTags:       true,
+					ErrorOnInlineDuplicates: true,
+					IntMinSize:              true,
+					NilMapAsEmpty:           true,
+					NilSliceAsEmpty:         true,
+					NilByteSliceAsEmpty:     true,
+					OmitZeroStruct:          true,
+					StringifyMapKeysWithFmt: true,
+				}).
+				SetRegistry(bson.NewRegistry())
+			customColl := db.Collection("custom_opts_coverage", customCollOpts)
+			customCollBytes, mErr := ExportMarshalWithCollection(customColl, bson.M{"a": 1})
+			Expect(mErr).NotTo(HaveOccurred())
+			Expect(customCollBytes).NotTo(BeEmpty())
 
 			// Driver errors via Disconnect for Delete, DeleteById, Save (ReplaceOne + InsertOne), SaveAll, ExistsById
 			Expect(client.Disconnect(context.Background())).NotTo(HaveOccurred())
