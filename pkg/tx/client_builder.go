@@ -245,13 +245,15 @@ func (this *MongoClientBuilder) Build(ctx ...context.Context) (*mongo.Client, Er
 	}
 
 	if err := client.Ping(connectCtx, nil); err != nil {
+		var cleanupCtx context.Context
+		var cleanupCancel context.CancelFunc
 		if timeout > 0 {
-			cleanupCtx, cleanupCancel := context.WithTimeout(baseCtx, timeout)
-			defer cleanupCancel()
-			_ = client.Disconnect(cleanupCtx)
+			cleanupCtx, cleanupCancel = context.WithTimeout(baseCtx, timeout)
 		} else {
-			_ = client.Disconnect(baseCtx)
+			cleanupCtx, cleanupCancel = context.WithTimeout(context.Background(), defaultConnectTimeout)
 		}
+		defer cleanupCancel()
+		_ = client.Disconnect(cleanupCtx)
 		return nil, NewWrappedError("MongoConnectionError", err)
 	}
 

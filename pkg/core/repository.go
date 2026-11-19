@@ -138,6 +138,9 @@ func (this *MongoRepository[T, K]) Query(queries ...MongoQueryFunc) *MongoQuery 
 
 // FindById finds a document by its _id field and returns an [Optional] pointer.
 func (this *MongoRepository[T, K]) FindById(id K) Optional[*T] {
+	if this.database == nil {
+		return OptionalEmpty[*T]()
+	}
 	ctx, err := this.validateActiveSession()
 	if err != nil {
 		return OptionalEmpty[*T]()
@@ -166,6 +169,9 @@ func (this *MongoRepository[T, K]) Count() (int64, Error) {
 
 // ExistsById returns true if a document with the given _id exists in the collection.
 func (this *MongoRepository[T, K]) ExistsById(id K) (bool, Error) {
+	if this.database == nil {
+		return false, NewError("MongoConfigurationError", "Database is not configured for repository")
+	}
 	ctx, err := this.validateActiveSession()
 	if err != nil {
 		return false, err
@@ -339,7 +345,7 @@ func (this *MongoRepository[T, K]) EnsureIndexes(ctx context.Context, models ...
 func (this *MongoRepository[T, K]) PostConstruct(parent any) Error {
 	this.collectionName = this.resolveCollectionName()
 	reflectType := reflect.TypeOf(parent)
-	queryBuilder := mongoQueryBuilder[T, K]{}.New(this.logger)
+	queryBuilder := mongoQueryBuilder[T, K]{}.New(this.logger, this.Collection())
 	for field := range reflectType.Elem().Fields() {
 		if field.Type.Kind() != reflect.Func {
 			continue
@@ -361,7 +367,21 @@ func (this *MongoRepository[T, K]) PostConstruct(parent any) Error {
 	return nil
 }
 
-func findIDField(v reflect.Value) reflect.Value {
+func collectionUseJSONStructTags(coll *mongo.Collection) bool {
+	if coll == nil {
+		return false
+	}
+	optsField := reflect.ValueOf(coll).Elem().FieldByName("bsonOpts")
+	if optsField.IsValid() {
+		optsVal := UnprotectValue(optsField)
+		if o, ok := optsVal.Interface().(*options.BSONOptions); ok && o != nil {
+			return o.UseJSONStructTags
+		}
+	}
+	return false
+}
+
+func findIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
 	for v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return reflect.Value{}
@@ -372,19 +392,20 @@ func findIDField(v reflect.Value) reflect.Value {
 		return reflect.Value{}
 	}
 
+	useJSON := len(useJSONTags) > 0 && useJSONTags[0]
 	t := v.Type()
-	// Prefer explicit bson:"_id" tag
+	// Prefer explicit bson:"_id" tag, then json:"_id" when UseJSONStructTags is enabled
 	for i := range t.NumField() {
 		field := t.Field(i)
 		if !field.IsExported() {
 			continue
 		}
-		bsonName, inline, skip := parseBSONTag(&field)
+		bsonName, inline, skip := parseBSONTag(&field, useJSON)
 		if skip {
 			continue
 		}
 		if inline {
-			if sub := findIDField(v.Field(i)); sub.IsValid() {
+			if sub := findIDField(v.Field(i), useJSON); sub.IsValid() {
 				return sub
 			}
 			continue
@@ -394,7 +415,7 @@ func findIDField(v reflect.Value) reflect.Value {
 		}
 	}
 	// Untagged "ID" fields are intentionally not selected as identity because the MongoDB driver
-	// only serializes fields to "_id" if explicitly tagged with bson:"_id".
+	// only serializes fields to "_id" if explicitly tagged with bson:"_id" (or json:"_id" with UseJSONStructTags).
 	return reflect.Value{}
 }
 
@@ -476,7 +497,8 @@ func entityIDStatus(coll *mongo.Collection, object any) (idStatus, Error) {
 	if object == nil {
 		return idStatus{}, nil
 	}
-	idField := findIDField(reflect.ValueOf(object))
+	useJSON := collectionUseJSONStructTags(coll)
+	idField := findIDField(reflect.ValueOf(object), useJSON)
 
 	rawBytes, err := marshalWithCollection(coll, object)
 	if err != nil {

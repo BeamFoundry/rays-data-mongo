@@ -40,10 +40,14 @@ type mongoQueryBuilder[T any, ID comparable] struct {
 	operators []string
 }
 
-func (this mongoQueryBuilder[T, ID]) New(logger Logging) *mongoQueryBuilder[T, ID] {
+func (this mongoQueryBuilder[T, ID]) New(logger Logging, coll ...*mongo.Collection) *mongoQueryBuilder[T, ID] {
 	this.logger = logger
+	var useJSONTags bool
+	if len(coll) > 0 && coll[0] != nil {
+		useJSONTags = collectionUseJSONStructTags(coll[0])
+	}
 	entity := reflect.TypeFor[T]()
-	this.fields = collectQueryFields(entity, "", "", map[reflect.Type]bool{})
+	this.fields = collectQueryFields(entity, "", "", map[reflect.Type]bool{}, useJSONTags)
 
 	// Sort longest field names first so nested/longer names (e.g. AddressCity, UserName)
 	// match before prefixes (e.g. Address, User).
@@ -77,7 +81,7 @@ func (this mongoQueryBuilder[T, ID]) New(logger Logging) *mongoQueryBuilder[T, I
 	return &this
 }
 
-func collectQueryFields(t reflect.Type, camelPrefix, bsonPrefix string, visited map[reflect.Type]bool) []queryField {
+func collectQueryFields(t reflect.Type, camelPrefix, bsonPrefix string, visited map[reflect.Type]bool, useJSONTags bool) []queryField {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
@@ -95,13 +99,13 @@ func collectQueryFields(t reflect.Type, camelPrefix, bsonPrefix string, visited 
 		if !field.IsExported() {
 			continue
 		}
-		bsonName, inline, skip := parseBSONTag(&field)
+		bsonName, inline, skip := parseBSONTag(&field, useJSONTags)
 		if skip {
 			continue
 		}
 
 		if inline {
-			sub := collectQueryFields(field.Type, camelPrefix, bsonPrefix, visited)
+			sub := collectQueryFields(field.Type, camelPrefix, bsonPrefix, visited, useJSONTags)
 			fields = append(fields, sub...)
 			continue
 		}
@@ -115,32 +119,52 @@ func collectQueryFields(t reflect.Type, camelPrefix, bsonPrefix string, visited 
 		})
 
 		if isNestedDocumentStruct(field.Type) {
-			sub := collectQueryFields(field.Type, camel, path+".", visited)
+			sub := collectQueryFields(field.Type, camel, path+".", visited, useJSONTags)
 			fields = append(fields, sub...)
 		}
 	}
 	return fields
 }
 
-func parseBSONTag(field *reflect.StructField) (name string, inline, skip bool) {
+func parseBSONTag(field *reflect.StructField, useJSONTags ...bool) (name string, inline, skip bool) {
 	tag, ok := field.Tag.Lookup("bson")
-	if !ok {
-		return strings.ToLower(field.Name), false, false
+	if ok {
+		if tag == "-" {
+			return "", false, true
+		}
+		parts := strings.Split(tag, ",")
+		name = parts[0]
+		for _, opt := range parts[1:] {
+			if opt == "inline" {
+				inline = true
+			}
+		}
+		if name == "" && !inline {
+			name = strings.ToLower(field.Name)
+		}
+		return name, inline, false
 	}
-	if tag == "-" {
-		return "", false, true
-	}
-	parts := strings.Split(tag, ",")
-	name = parts[0]
-	for _, opt := range parts[1:] {
-		if opt == "inline" {
-			inline = true
+
+	if len(useJSONTags) > 0 && useJSONTags[0] {
+		if jtag, jok := field.Tag.Lookup("json"); jok {
+			if jtag == "-" {
+				return "", false, true
+			}
+			parts := strings.Split(jtag, ",")
+			name = parts[0]
+			for _, opt := range parts[1:] {
+				if opt == "inline" {
+					inline = true
+				}
+			}
+			if name == "" && !inline {
+				name = strings.ToLower(field.Name)
+			}
+			return name, inline, false
 		}
 	}
-	if name == "" && !inline {
-		name = strings.ToLower(field.Name)
-	}
-	return name, inline, false
+
+	return strings.ToLower(field.Name), false, false
 }
 
 func isNestedDocumentStruct(t reflect.Type) bool {
@@ -438,7 +462,7 @@ func (this *mongoCompiledQuery[T, ID]) buildFilter(in []reflect.Value) (filter a
 		for i := consumed; i < consumed+condition.NumArgs(); i++ {
 			args = append(args, in[i].Interface())
 		}
-		this.logger.Trace("Adding condition", "field", condition.field.bsonPath, "args", args)
+		this.logger.Trace("Adding condition", "field", condition.field.bsonPath, "operator", condition.operator.Name(), "argCount", condition.NumArgs())
 		f := condition.Filter(args...)
 		consumed += condition.NumArgs()
 

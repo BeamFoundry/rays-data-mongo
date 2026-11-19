@@ -56,7 +56,7 @@ func (c *MongoConfig) Client() (*mongo.Client, Error) {
 
 ## Bridging Custom `*mongo.Client` Beams Directly
 
-If you construct `*options.ClientOptions` manually, inject `options.LogSink` (or register `MongoLogSink{}.New()` from `pkg/util` as a Beam) and pass it to `options.Logger()`:
+If you construct `*options.ClientOptions` manually, inject `options.LogSink` (or register `MongoLogSink{}.New()` from `pkg/util` initialized with an injected `Logging` value via `WithLogger(logger)` before returning it, so startup and driver logs use the initialized logger) and pass it to `options.Logger()`:
 
 ```go
 loggerOpts := options.Logger().

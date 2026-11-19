@@ -399,10 +399,14 @@ func (this *MongoQuery) FindOptions() []*options.FindOptions {
 	allOpts := make([]*options.FindOptions, 0, 1+len(this.extraFindOpts))
 	base := options.Find()
 	if len(this.sort) > 0 {
-		base.SetSort(this.sort)
+		sortCopy := make(bson.D, len(this.sort))
+		copy(sortCopy, this.sort)
+		base.SetSort(sortCopy)
 	}
 	if len(this.projection) > 0 {
-		base.SetProjection(this.projection)
+		projCopy := make(bson.D, len(this.projection))
+		copy(projCopy, this.projection)
+		base.SetProjection(projCopy)
 	}
 	if this.limit != nil && *this.limit > 0 {
 		base.SetLimit(*this.limit)
@@ -427,10 +431,14 @@ func (this *MongoQuery) FindOptions() []*options.FindOptions {
 func (this *MongoQuery) findOneOptions() *options.FindOneOptions {
 	opt := options.FindOne()
 	if len(this.sort) > 0 {
-		opt.SetSort(this.sort)
+		sortCopy := make(bson.D, len(this.sort))
+		copy(sortCopy, this.sort)
+		opt.SetSort(sortCopy)
 	}
 	if len(this.projection) > 0 {
-		opt.SetProjection(this.projection)
+		projCopy := make(bson.D, len(this.projection))
+		copy(projCopy, this.projection)
+		opt.SetProjection(projCopy)
 	}
 	if this.skip != nil && *this.skip > 0 {
 		opt.SetSkip(*this.skip)
@@ -808,12 +816,18 @@ func convertDistinctValue(val any, targetType reflect.Type) (reflect.Value, Erro
 		return rawVal, nil
 	}
 	if isNumericKind(rawVal.Kind()) && isNumericKind(targetType.Kind()) {
+		if (rawVal.Kind() == reflect.Float32 || rawVal.Kind() == reflect.Float64) && targetType.Kind() <= reflect.Uint64 {
+			f := rawVal.Float()
+			if math.Trunc(f) != f {
+				return reflect.Value{}, NewError("IllegalArgumentError", fmt.Sprintf("Fractional floating-point value %v cannot be converted to integer type %s", val, targetType.String()))
+			}
+		}
 		if !fitsNumericRange(rawVal, targetType) {
 			return reflect.Value{}, NewError("IllegalArgumentError", fmt.Sprintf("Value %v is out of range for destination type %s", val, targetType.String()))
 		}
 		return rawVal.Convert(targetType), nil
 	}
-	if rawVal.CanConvert(targetType) {
+	if rawVal.CanConvert(targetType) && (rawVal.Kind() == reflect.String) == (targetType.Kind() == reflect.String) {
 		return rawVal.Convert(targetType), nil
 	}
 
@@ -962,6 +976,14 @@ func copyFilterWithVisited(val any, visited map[visitedPointerKey]any) any {
 			}
 			return newPtr.Interface()
 		default:
+			if bin, ok := val.(primitive.Binary); ok {
+				copiedData := make([]byte, len(bin.Data))
+				copy(copiedData, bin.Data)
+				return primitive.Binary{
+					Subtype: bin.Subtype,
+					Data:    copiedData,
+				}
+			}
 			return val
 		}
 	}

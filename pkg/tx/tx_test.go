@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -46,14 +47,27 @@ func (m *mockCommitErrSession) CommitTransaction(context.Context) error {
 
 type recordingLogSink struct {
 	messages []string
+	mu       sync.Mutex
 }
 
 func (r *recordingLogSink) Info(_ int, msg string, _ ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.messages = append(r.messages, msg)
 }
 
 func (r *recordingLogSink) Error(_ error, msg string, _ ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.messages = append(r.messages, msg)
+}
+
+func (r *recordingLogSink) Snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	copied := make([]string, len(r.messages))
+	copy(copied, r.messages)
+	return copied
 }
 
 type dummyLogSink struct{}
@@ -225,7 +239,8 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		Expect(cNoCmd.Database("test_tx_db").RunCommand(context.Background(), bson.D{{Key: "ping", Value: 1}}).Err()).NotTo(HaveOccurred())
 		Expect(cNoCmd.Disconnect(context.Background())).NotTo(HaveOccurred())
 
-		for _, msg := range recSink.messages {
+		snapshot := recSink.Snapshot()
+		for _, msg := range snapshot {
 			Expect(strings.Contains(msg, "Command started")).To(BeFalse())
 			Expect(strings.Contains(msg, "Command succeeded")).To(BeFalse())
 		}
@@ -349,10 +364,22 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		Expect(mockSess.commitCalls).To(Equal(1))
 		Expect(msMock.Validate()).To(HaveOccurred()) // commitPending is true
 		Expect(msMock.Error()).NotTo(HaveOccurred()) // Not cached, retry allowed
+		Expect(msMock.Rollback()).To(HaveOccurred()) // Cannot rollback with pending commit result
 		mockSess.commitErr = nil
 		Expect(msMock.Commit()).NotTo(HaveOccurred()) // Retry succeeds
 		Expect(mockSess.commitCalls).To(Equal(2))
 		msMock.End()
+
+		// Mock session with expired context retrying on UnknownTransactionCommitResult
+		cancCtx, cancFn := context.WithCancel(context.Background())
+		cancFn()
+		rawSessRetry, err := client.StartSession()
+		Expect(err).NotTo(HaveOccurred())
+		mockSessRetry := &mockCommitErrSession{Session: rawSessRetry, commitErr: errors.New("UnknownTransactionCommitResult")}
+		msMockRetry := NewMongoSession(cancCtx, mockSessRetry)
+		Expect(msMockRetry.Commit()).To(HaveOccurred())
+		Expect(mockSessRetry.commitCalls).To(Equal(2))
+		msMockRetry.End()
 
 		// Mock session with terminal non-retryable error (cached)
 		rawSess2, err := client.StartSession()

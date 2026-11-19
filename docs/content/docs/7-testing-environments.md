@@ -56,6 +56,8 @@ import (
     . "github.com/onsi/ginkgo/v2"
     . "github.com/onsi/gomega"
 
+    "myapp/repositories"
+
     _ "github.com/BeamFoundry/rays-data-mongo"
     . "github.com/BeamFoundry/rays-data-mongo/pkg/tx"
     . "github.com/BeamFoundry/rays/pkg/core"
@@ -127,7 +129,7 @@ var _ = Describe("UserRepository", Ordered, func() {
 
     BeforeEach(func() {
         AddBeamFor(&TestMongoConfig{host: mongoHost, port: mongoPort})
-        AddBeamFor(&UserRepository{})
+        AddBeamFor(&repositories.UserRepository{})
         GetContainer().EnableScanning()
         Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
     })
@@ -140,11 +142,11 @@ var _ = Describe("UserRepository", Ordered, func() {
     })
 
     It("writes and reads documents with transactional rollback isolation", func() {
-        repo := GetBeamScopedInstance[*UserRepository]()
+        repo := GetBeamScopedInstance[*repositories.UserRepository]()
         txMgr := GetBeamScopedInstance[MongoTransactional]()
 
         // Standard write and read against the replica set
-        saved, err := repo.Save(&User{Name: "Alice", Age: 30})
+        saved, err := repo.Save(&repositories.User{Name: "Alice", Age: 30})
         Expect(err).NotTo(HaveOccurred())
 
         found := repo.FindById(saved.ID)
@@ -153,13 +155,16 @@ var _ = Describe("UserRepository", Ordered, func() {
         Expect(user.Name).To(Equal("Alice"))
 
         // Document saved in a rolled-back transaction is not visible outside
+        var saveSucceeded bool
         txMgr.Transactional(context.Background(), func(_ *MongoSession) Error {
-            _, saveErr := repo.Save(&User{Name: "Bob", Age: 25})
+            _, saveErr := repo.Save(&repositories.User{Name: "Bob", Age: 25})
             Expect(saveErr).NotTo(HaveOccurred())
+            saveSucceeded = true
             return NewError("RollbackError", "abort transaction")
         })
+        Expect(saveSucceeded).To(BeTrue())
 
-        Expect(repo.FindByName("Bob")).To(BeNil())
+        Expect(repo.FindByName("Bob").IsPresent()).To(BeFalse())
     })
 })
 ```

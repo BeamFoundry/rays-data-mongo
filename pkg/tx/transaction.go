@@ -132,7 +132,13 @@ func (this *MongoSession) Commit() Error {
 	if this.committed || this.aborted {
 		return NewError("TransactionError", "Transaction already finalized")
 	}
-	if err := this.session.CommitTransaction(this.ctx); err != nil {
+	err := this.session.CommitTransaction(this.ctx)
+	if err != nil && isUnknownTransactionCommitResult(err) && this.ctx.Err() != nil {
+		retryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err = this.session.CommitTransaction(mongo.NewSessionContext(retryCtx, this.session))
+	}
+	if err != nil {
 		wrapped := NewWrappedError("TransactionError", err)
 		if isUnknownTransactionCommitResult(err) {
 			this.commitPending = true
@@ -152,11 +158,17 @@ func (this *MongoSession) Rollback() Error {
 	if this == nil {
 		return NewError("TransactionError", "No active session")
 	}
+	if this.ended {
+		return NewError("TransactionError", "Session has already ended")
+	}
 	if this.session == nil {
 		if this.err != nil {
 			return this.err
 		}
 		return NewError("TransactionError", "No active MongoDB session to rollback")
+	}
+	if this.commitPending {
+		return NewError("TransactionError", "Cannot rollback transaction with pending commit result")
 	}
 	if this.committed || this.aborted {
 		return NewError("TransactionError", "Transaction already finalized")
@@ -312,13 +324,12 @@ func (this *MongoTransactionalManager) End() {
 //nolint:contextcheck // Rollback and End use bounded cleanup contexts independent of request cancellation
 func (this *MongoTransactionalManager) Transactional(ctx context.Context, action func(sess *MongoSession) Error) {
 	ms := this.Start(ctx)
-	//nolint:contextcheck // End() uses bounded cleanup context
-	defer this.End()
-
 	if ms.Error() != nil {
 		ms.Error().LogError()
 		return
 	}
+	//nolint:contextcheck // End() uses bounded cleanup context
+	defer this.End()
 
 	var actionErr Error
 	panicked := true
@@ -350,12 +361,11 @@ func (this *MongoTransactionalManager) Transactional(ctx context.Context, action
 //nolint:contextcheck // Rollback and End use bounded cleanup contexts independent of request cancellation
 func (this *MongoTransactionalManager) Execute(ctx context.Context, action func(sess *MongoSession) Error) (retErr Error) {
 	ms := this.Start(ctx)
-	//nolint:contextcheck // End() uses bounded cleanup context
-	defer this.End()
-
 	if ms.Error() != nil {
 		return ms.Error()
 	}
+	//nolint:contextcheck // End() uses bounded cleanup context
+	defer this.End()
 
 	panicked := true
 	defer func() {
@@ -392,12 +402,11 @@ func ExecuteWithResult[T any](ctx context.Context, mgr *MongoTransactionalManage
 	}
 
 	ms := mgr.Start(ctx)
-	//nolint:contextcheck // End() uses bounded cleanup context
-	defer mgr.End()
-
 	if ms.Error() != nil {
 		return zero, ms.Error()
 	}
+	//nolint:contextcheck // End() uses bounded cleanup context
+	defer mgr.End()
 
 	panicked := true
 	defer func() {

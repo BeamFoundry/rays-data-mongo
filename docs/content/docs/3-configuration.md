@@ -77,6 +77,16 @@ func (c *MultiMongoConfig) AnalyticsClient() (*mongo.Client, Error) {
         Build()
 }
 
+func (c *MultiMongoConfig) PrimaryTxManager(
+    that struct {
+        Primary
+        client *mongo.Client `@:"Inject"`
+        logger Logging       `@:"Inject"`
+    },
+) MongoTransactional {
+    return NewMongoTransactionalManager(that.client, that.logger)
+}
+
 func (c *MultiMongoConfig) AnalyticsTxManager(
     that struct {
         Qualifier `Name:"analyticsTx"`

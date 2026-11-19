@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/testcontainers/testcontainers-go"
@@ -12,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/event"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
@@ -1122,7 +1124,10 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 
 			// UnexportedFieldEntity: findIDField skips unexported fields
 			unexportedRepo := &UnexportedFieldRepo{}
-			Expect(unexportedRepo.Delete(&UnexportedFieldEntity{unexportedID: "id1", Name: "name"})).To(HaveOccurred())
+			unexportedErr := unexportedRepo.Delete(&UnexportedFieldEntity{unexportedID: "id1", Name: "name"})
+			Expect(unexportedErr).To(HaveOccurred())
+			Expect(unexportedErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(unexportedErr.Error()).To(ContainSubstring("use DeleteById with the actual key"))
 
 			// Nil inner pointer & non-struct entity for findIDField
 			var nilUserPtr *User
@@ -1301,7 +1306,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 				WorkOrderByName: "order-alpha",
 				Status:          "open",
 				Name:            "alpha",
-				AgeLess:         5,
+				AgeLess:         35,
 				Age:             25,
 			})
 			Expect(err).NotTo(HaveOccurred())
@@ -1522,12 +1527,46 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(mgr.Get()).To(Equal(sOuter))
 			mgr.End()
 
-			// 9. Canceled context Rollback and End
+			// 9. Canceled context Rollback and End with command monitor verification
+			var abortSent bool
+			var abortMu sync.Mutex
+			monitoredClient, mErr := NewMongoClientBuilder().
+				WithURI(mongoURI).
+				WithOptions(func(opts *options.ClientOptions) {
+					opts.SetMonitor(&event.CommandMonitor{
+						Started: func(_ context.Context, evt *event.CommandStartedEvent) {
+							if evt.CommandName == "abortTransaction" {
+								abortMu.Lock()
+								abortSent = true
+								abortMu.Unlock()
+							}
+						},
+					})
+				}).
+				Build()
+			Expect(mErr).NotTo(HaveOccurred())
+			defer func() { _ = monitoredClient.Disconnect(context.Background()) }()
+
+			monitoredMgr := NewMongoTransactionalManager(monitoredClient, nil)
+			monitoredColl := monitoredClient.Database("test_db").Collection("users")
+
 			cancelCtx, cancelFn := context.WithCancel(context.Background())
-			sCancel := mgr.Start(cancelCtx)
+			sCancel := monitoredMgr.Start(cancelCtx)
+
+			cancelDocID := primitive.NewObjectID()
+			_, insErr := monitoredColl.InsertOne(sCancel.Context(), bson.M{"_id": cancelDocID, "name": "cancel_user"})
+			Expect(insErr).NotTo(HaveOccurred())
+
 			cancelFn()
 			Expect(sCancel.Rollback()).NotTo(HaveOccurred())
-			mgr.End()
+			monitoredMgr.End()
+
+			abortMu.Lock()
+			Expect(abortSent).To(BeTrue())
+			abortMu.Unlock()
+
+			var missingDoc bson.M
+			Expect(monitoredColl.FindOne(context.Background(), bson.M{"_id": cancelDocID}).Decode(&missingDoc)).To(Equal(mongo.ErrNoDocuments))
 
 			// 10. Command logging opt-in builder verification
 			bCmdOn := NewMongoClientBuilder().WithLogSink(MongoLogSink{}.New()).WithCommandLogging(true)
@@ -1854,12 +1893,12 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect((*copiedCyclic)["self"]).To(BeIdenticalTo(copiedCyclic))
 
 			// 20. marshalWithCollection with nil collection, empty collection without registry/opts, and custom collection with BSONOptions & registry
-			nilCollBytes, mErr := ExportMarshalWithCollection(nil, bson.M{"a": 1})
-			Expect(mErr).NotTo(HaveOccurred())
+			nilCollBytes, marshErr := ExportMarshalWithCollection(nil, bson.M{"a": 1})
+			Expect(marshErr).NotTo(HaveOccurred())
 			Expect(nilCollBytes).NotTo(BeEmpty())
 
-			emptyCollBytes, mErr := ExportMarshalWithCollection(&mongo.Collection{}, bson.M{"a": 1})
-			Expect(mErr).NotTo(HaveOccurred())
+			emptyCollBytes, marshErr := ExportMarshalWithCollection(&mongo.Collection{}, bson.M{"a": 1})
+			Expect(marshErr).NotTo(HaveOccurred())
 			Expect(emptyCollBytes).NotTo(BeEmpty())
 
 			customCollOpts := options.Collection().
@@ -1875,9 +1914,84 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 				}).
 				SetRegistry(bson.NewRegistry())
 			customColl := db.Collection("custom_opts_coverage", customCollOpts)
-			customCollBytes, mErr := ExportMarshalWithCollection(customColl, bson.M{"a": 1})
-			Expect(mErr).NotTo(HaveOccurred())
+			customCollBytes, marshErr := ExportMarshalWithCollection(customColl, bson.M{"a": 1})
+			Expect(marshErr).NotTo(HaveOccurred())
 			Expect(customCollBytes).NotTo(BeEmpty())
+
+			// 21. collectionUseJSONStructTags tests
+			Expect(ExportCollectionUseJSONStructTags(nil)).To(BeFalse())
+			var nilCollPtr *mongo.Collection
+			Expect(ExportCollectionUseJSONStructTags(nilCollPtr)).To(BeFalse())
+			Expect(ExportCollectionUseJSONStructTags(&mongo.Collection{})).To(BeFalse())
+			Expect(ExportCollectionUseJSONStructTags(customColl)).To(BeTrue())
+			customCollFalse := db.Collection("custom_opts_coverage_false", options.Collection().SetBSONOptions(&options.BSONOptions{UseJSONStructTags: false}))
+			Expect(ExportCollectionUseJSONStructTags(customCollFalse)).To(BeFalse())
+
+			// 22. parseBSONTag tests with and without useJSONTags
+			skipField := reflect.StructField{Name: "Skip", Tag: reflect.StructTag(`json:"-"`)}
+			sName, sInline, sSkip := ExportParseBSONTag(&skipField, true)
+			Expect(sSkip).To(BeTrue())
+			Expect(sName).To(BeEmpty())
+			Expect(sInline).To(BeFalse())
+
+			customJSONField := reflect.StructField{Name: "Custom", Tag: reflect.StructTag(`json:"custom_field"`)}
+			cName, cInline, cSkip := ExportParseBSONTag(&customJSONField, true)
+			Expect(cSkip).To(BeFalse())
+			Expect(cName).To(Equal("custom_field"))
+			Expect(cInline).To(BeFalse())
+
+			// without useJSONTags, json tag is ignored and field name is lowercased
+			cNameNoJSON, _, _ := ExportParseBSONTag(&customJSONField, false)
+			Expect(cNameNoJSON).To(Equal("custom"))
+
+			inlineJSONField := reflect.StructField{Name: "Inline", Tag: reflect.StructTag(`json:",inline"`)}
+			iName, iInline, iSkip := ExportParseBSONTag(&inlineJSONField, true)
+			Expect(iSkip).To(BeFalse())
+			Expect(iInline).To(BeTrue())
+			Expect(iName).To(BeEmpty())
+
+			omitJSONField := reflect.StructField{Name: "OmitField", Tag: reflect.StructTag(`json:",omitempty"`)}
+			oName, oInline, oSkip := ExportParseBSONTag(&omitJSONField, true)
+			Expect(oSkip).To(BeFalse())
+			Expect(oInline).To(BeFalse())
+			Expect(oName).To(Equal("omitfield"))
+
+			// 23. unconfigured repository (database == nil) FindById and ExistsById
+			unconfiguredRepo := &MongoRepository[User, primitive.ObjectID]{}
+			Expect(unconfiguredRepo.FindById(primitive.NewObjectID()).IsPresent()).To(BeFalse())
+			unconfExists, unconfExistsErr := unconfiguredRepo.ExistsById(primitive.NewObjectID())
+			Expect(unconfExists).To(BeFalse())
+			Expect(unconfExistsErr).To(HaveOccurred())
+			Expect(unconfExistsErr.Name()).To(Equal("MongoConfigurationError"))
+
+			// 24. convertDistinctValue fractional float and convertible string
+			_, fracErr := ExportConvertDistinctValue(12.5, reflect.TypeFor[int]())
+			Expect(fracErr).To(HaveOccurred())
+			Expect(fracErr.Name()).To(Equal("IllegalArgumentError"))
+
+			type customCoverageString string
+			convStrVal, convStrErr := ExportConvertDistinctValue(customCoverageString("hello"), reflect.TypeFor[string]())
+			Expect(convStrErr).NotTo(HaveOccurred())
+			Expect(convStrVal.String()).To(Equal("hello"))
+
+			// 25. copyFilter with primitive.Binary
+			binVal := primitive.Binary{Subtype: 0x80, Data: []byte{10, 20, 30}}
+			copiedBinVal, isBin := ExportCopyFilter(binVal).(primitive.Binary)
+			Expect(isBin).To(BeTrue())
+			Expect(copiedBinVal.Subtype).To(Equal(binVal.Subtype))
+			Expect(copiedBinVal.Data).To(Equal(binVal.Data))
+			copiedBinVal.Data[0] = 99
+			Expect(binVal.Data[0]).To(Equal(byte(10)))
+
+			// 26. detached sort and projection in FindOptions
+			qSort := userRepo.Query().Order(bson.D{{Key: "name", Value: 1}}).Select("email")
+			fOpts := qSort.FindOptions()
+			Expect(fOpts).NotTo(BeEmpty())
+			fOpts[0].Sort.(bson.D)[0].Key = "mutated"
+			fOpts[0].Projection.(bson.D)[0].Key = "mutated"
+			fOpts2 := qSort.FindOptions()
+			Expect(fOpts2[0].Sort.(bson.D)[0].Key).To(Equal("name"))
+			Expect(fOpts2[0].Projection.(bson.D)[0].Key).To(Equal("email"))
 
 			// Driver errors via Disconnect for Delete, DeleteById, Save (ReplaceOne + InsertOne), SaveAll, ExistsById
 			Expect(client.Disconnect(context.Background())).NotTo(HaveOccurred())

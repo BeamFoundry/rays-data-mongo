@@ -53,3 +53,13 @@ func ExportAssignGeneratedID(idField reflect.Value) bool {
 func ExportMarshalWithCollection(coll *mongo.Collection, val any) ([]byte, error) {
 	return marshalWithCollection(coll, val)
 }
+
+// ExportParseBSONTag exposes parseBSONTag for testing.
+func ExportParseBSONTag(field *reflect.StructField, useJSONTags ...bool) (name string, inline, skip bool) {
+	return parseBSONTag(field, useJSONTags...)
+}
+
+// ExportCollectionUseJSONStructTags exposes collectionUseJSONStructTags for testing.
+func ExportCollectionUseJSONStructTags(coll *mongo.Collection) bool {
+	return collectionUseJSONStructTags(coll)
+}

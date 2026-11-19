@@ -20,7 +20,7 @@ import (
 | Category | Function | Signature | Description |
 |---|---|---|---|
 | **Pagination** | `Paginate` | `Paginate(page, pageSize int) MongoQueryFunc` | 1-indexed pagination (`skip = (page-1)*pageSize`, `limit = pageSize`) with safe defaults and overflow protection (`PaginationOverflowError`). |
-| **Limits** | `WithLimit` / `Limit` | `WithLimit(limit int64) MongoQueryFunc` | Limits returned documents; `WithLimit(0)` explicitly enforces zero results. |
+| **Limits** | `WithLimit` / `Limit` | `WithLimit(limit int64) MongoQueryFunc` | Limits returned documents; `WithLimit(0)` returns no results for `Find`, `First`, `Count`, and `Exists`, but does not suppress `Distinct` or `Aggregate`. |
 | **Skip / Offset** | `WithSkip` / `WithOffset` | `WithSkip(skip int64) MongoQueryFunc` | Skips documents; passing `0` clears any previously set skip. |
 | **Sorting** | `OrderByAsc` | `OrderByAsc(field string) MongoQueryFunc` | Sorts by `field` ascending (`1`). |
 | **Sorting** | `OrderByDesc` | `OrderByDesc(field string) MongoQueryFunc` | Sorts by `field` descending (`-1`). |
@@ -29,7 +29,7 @@ import (
 | **Projections** | `WithOmit` | `WithOmit(fields ...string) MongoQueryFunc` | Excludes the specified BSON fields (`0`). |
 | **Projections** | `WithProjection` | `WithProjection(proj any) MongoQueryFunc` | Applies an arbitrary MongoDB projection document. |
 | **Filtering** | `WithWhere` / `WithFilter` | `WithWhere(filter any) MongoQueryFunc` | Appends a BSON filter document (`bson.M`, `bson.D`). |
-| **Filtering** | `WithOr` | `WithOr(filters ...any) MongoQueryFunc` | Appends an `$or` filter clause. |
+| **Filtering** | `WithOr` | `WithOr(filters ...any) MongoQueryFunc` | Appends an `$or` filter clause. After `WithWhere(A)`, single-filter `WithOr(B)` matches `A OR B`, while multi-filter `WithOr(B, C)` matches `A AND (B OR C)`. |
 | **Collections** | `WithCollection` | `WithCollection(name string) MongoQueryFunc` | Overrides the target collection name (e.g. archive collections). |
 | **Mongo Options** | `WithHint` | `WithHint(hint any) MongoQueryFunc` | Specifies a MongoDB index hint. |
 | **Mongo Options** | `WithMaxTime` | `WithMaxTime(d time.Duration) MongoQueryFunc` | Sets server-side query timeout. |

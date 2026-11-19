@@ -9,8 +9,10 @@ MongoDB multi-document ACID transactions normally require creating a `mongo.Sess
 `mongo.SessionContext`, and passing that context through every repository call.
 
 Rays Data Mongo uses `github.com/timandy/routine` to manage **ThreadLocal** `MongoSession` state for
-your goroutines. When a service starts a transaction via `MongoTransactional`, all downstream repository
-operations automatically execute inside that `mongo.SessionContext`.
+your goroutines. Automatic session binding applies only to repository calls on the transaction's goroutine,
+and a query captures its session when created. Construct repository queries inside the transaction callback
+so that their operations use the active transaction session rather than executing unbound or capturing a
+stale session.
 
 > **Note:** MongoDB multi-document transactions require a MongoDB **replica set** or sharded cluster
 > (including single-node replica sets such as `mongod --replSet rs0`).
@@ -25,6 +27,8 @@ package services
 
 import (
     "context"
+
+    "go.mongodb.org/mongo-driver/bson"
 
     . "github.com/BeamFoundry/rays-data-mongo/pkg/tx"
     . "github.com/BeamFoundry/rays/pkg/core"
@@ -41,11 +45,20 @@ type OrderService struct {
 
 func (s *OrderService) UpdateUserWithAudit(ctx context.Context, user *User) {
     s.txManager.Transactional(ctx, func(_ *MongoSession) Error {
+        // Construct the query inside the callback so its operations capture the transaction session
+        count, err := s.userRepo.Query().Where(bson.M{"_id": user.ID}).Count()
+        if err != nil {
+            return err // Triggers Rollback
+        }
+        if count == 0 {
+            return NewError("user not found")
+        }
+
         if _, err := s.userRepo.Save(user); err != nil {
             return err // Triggers Rollback
         }
 
-        _, err := s.auditRepo.Save(&Audit{Action: "USER_UPDATED", TargetID: user.ID})
+        _, err = s.auditRepo.Save(&Audit{Action: "USER_UPDATED", TargetID: user.ID})
         if err != nil {
             return err // Triggers Rollback
         }
@@ -99,6 +112,7 @@ func (s *OrderService) Transfer(ctx context.Context, user *User) Error {
 }
 ```
 
-Once `sess.Commit()` or `sess.Rollback()` has been called on a manual `MongoSession`, any subsequent repository
-operations executed before `End()` will safely fail with a `TransactionError` rather than executing outside
-the finalized transaction.
+Once `sess.Commit()` or `sess.Rollback()` has been called on a manual `MongoSession`, the `TransactionError`
+guarantee is limited to repository methods that expose errors (such as `Save`, `SaveAll`, `Delete`, and
+`Query` execution paths). Repository methods that do not return errors, such as `FindById`, safely return an
+empty `Optional` after finalization and before `End()`, rather than returning a `TransactionError`.
