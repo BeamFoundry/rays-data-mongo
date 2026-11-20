@@ -156,15 +156,19 @@ var _ = Describe("UserRepository", Ordered, func() {
 
         // Document saved in a rolled-back transaction is not visible outside
         var saveSucceeded bool
+        var bob *repositories.User
         txMgr.Transactional(context.Background(), func(_ *MongoSession) Error {
-            _, saveErr := repo.Save(&repositories.User{Name: "Bob", Age: 25})
+            var saveErr Error
+            bob, saveErr = repo.Save(&repositories.User{Name: "Bob", Age: 25})
             Expect(saveErr).NotTo(HaveOccurred())
             saveSucceeded = true
             return NewError("RollbackError", "abort transaction")
         })
         Expect(saveSucceeded).To(BeTrue())
 
-        Expect(repo.FindByName("Bob").IsPresent()).To(BeFalse())
+        exists, err := repo.ExistsById(bob.ID)
+        Expect(err).NotTo(HaveOccurred())
+        Expect(exists).To(BeFalse())
     })
 })
 ```

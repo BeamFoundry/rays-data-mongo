@@ -245,6 +245,24 @@ type InlineMapRepo struct {
 	MongoRepository[InlineMapEntity, string]
 }
 
+type InlineBaseID struct {
+	ID primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+type ConflictingInlineEntity struct {
+	InlineBaseID `bson:",inline"`
+	ID           primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+type SoleInlineEntity struct {
+	Name         string `bson:"name"`
+	InlineBaseID `bson:",inline"`
+}
+
+type InlinePtrEntity struct {
+	Base *InlineBaseID `bson:",inline"`
+}
+
 type DescEntity struct {
 	Name        string             `bson:"name"`
 	Description string             `bson:"description"`
@@ -1992,6 +2010,33 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			fOpts2 := qSort.FindOptions()
 			Expect(fOpts2[0].Sort.(bson.D)[0].Key).To(Equal("name"))
 			Expect(fOpts2[0].Projection.(bson.D)[0].Key).To(Equal("email"))
+
+			// 27. findIDField field dominance: shallower entity ID wins over conflicting inline Base ID
+			confEntity := &ConflictingInlineEntity{}
+			confIDField := ExportFindIDField(reflect.ValueOf(confEntity))
+			Expect(confIDField.IsValid()).To(BeTrue())
+			Expect(confIDField.Addr().Pointer()).To(Equal(reflect.ValueOf(&confEntity.ID).Pointer()))
+			Expect(confIDField.Addr().Pointer()).NotTo(Equal(reflect.ValueOf(&confEntity.InlineBaseID.ID).Pointer()))
+			Expect(ExportAssignGeneratedID(confIDField)).To(BeTrue())
+			Expect(confEntity.ID.IsZero()).To(BeFalse())
+			Expect(confEntity.InlineBaseID.ID.IsZero()).To(BeTrue())
+
+			// Preserve ID generation when inline ID is the only eligible ID field
+			soleEntity := &SoleInlineEntity{}
+			soleIDField := ExportFindIDField(reflect.ValueOf(soleEntity))
+			Expect(soleIDField.IsValid()).To(BeTrue())
+			Expect(soleIDField.Addr().Pointer()).To(Equal(reflect.ValueOf(&soleEntity.InlineBaseID.ID).Pointer()))
+			Expect(ExportAssignGeneratedID(soleIDField)).To(BeTrue())
+			Expect(soleEntity.InlineBaseID.ID.IsZero()).To(BeFalse())
+
+			// Inline pointer struct: nil pointer skips, non-nil pointer finds ID
+			nilPtrEntity := &InlinePtrEntity{Base: nil}
+			Expect(ExportFindIDField(reflect.ValueOf(nilPtrEntity)).IsValid()).To(BeFalse())
+
+			nonNilPtrEntity := &InlinePtrEntity{Base: &InlineBaseID{}}
+			ptrIDField := ExportFindIDField(reflect.ValueOf(nonNilPtrEntity))
+			Expect(ptrIDField.IsValid()).To(BeTrue())
+			Expect(ptrIDField.Addr().Pointer()).To(Equal(reflect.ValueOf(&nonNilPtrEntity.Base.ID).Pointer()))
 
 			// Driver errors via Disconnect for Delete, DeleteById, Save (ReplaceOne + InsertOne), SaveAll, ExistsById
 			Expect(client.Disconnect(context.Background())).NotTo(HaveOccurred())

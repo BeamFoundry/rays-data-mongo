@@ -45,6 +45,22 @@ func (m *mockCommitErrSession) CommitTransaction(context.Context) error {
 	return m.commitErr
 }
 
+type mockSeqCommitSession struct {
+	mongo.Session
+	errs        []error
+	commitCalls int
+}
+
+func (m *mockSeqCommitSession) CommitTransaction(context.Context) error {
+	m.commitCalls++
+	if len(m.errs) > 0 {
+		err := m.errs[0]
+		m.errs = m.errs[1:]
+		return err
+	}
+	return nil
+}
+
 type recordingLogSink struct {
 	messages []string
 	mu       sync.Mutex
@@ -380,6 +396,52 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		Expect(msMockRetry.Commit()).To(HaveOccurred())
 		Expect(mockSessRetry.commitCalls).To(Equal(2))
 		msMockRetry.End()
+
+		// Mock session with unknown commit result followed by server selection timeout on retry,
+		// preserving commitPending without caching terminal error, followed by successful subsequent Commit.
+		cancCtx2, cancFn2 := context.WithCancel(context.Background())
+		cancFn2()
+		rawSessSeq, err := client.StartSession()
+		Expect(err).NotTo(HaveOccurred())
+		seqMock := &mockSeqCommitSession{
+			Session: rawSessSeq,
+			errs: []error{
+				errors.New("UnknownTransactionCommitResult"),
+				errors.New("server selection timeout"),
+			},
+		}
+		msSeq := NewMongoSession(cancCtx2, seqMock)
+		commitErr := msSeq.Commit()
+		Expect(commitErr).To(HaveOccurred())
+		Expect(seqMock.commitCalls).To(Equal(2))
+		Expect(msSeq.Validate()).To(HaveOccurred()) // commitPending remains true
+		Expect(msSeq.Error()).NotTo(HaveOccurred()) // inconclusive error is not cached as terminal
+
+		// Subsequent Commit on the same session succeeds
+		Expect(msSeq.Commit()).NotTo(HaveOccurred())
+		Expect(seqMock.commitCalls).To(Equal(3))
+		Expect(msSeq.Error()).NotTo(HaveOccurred())
+		msSeq.End()
+
+		// Mock session where retry of CommitTransaction succeeds immediately
+		cancCtx3, cancFn3 := context.WithCancel(context.Background())
+		cancFn3()
+		rawSessSuccess, err := client.StartSession()
+		Expect(err).NotTo(HaveOccurred())
+		seqMockSuccess := &mockSeqCommitSession{
+			Session: rawSessSuccess,
+			errs: []error{
+				errors.New("UnknownTransactionCommitResult"),
+			},
+		}
+		msSeqSuccess := NewMongoSession(cancCtx3, seqMockSuccess)
+		Expect(msSeqSuccess.Commit()).NotTo(HaveOccurred())
+		Expect(seqMockSuccess.commitCalls).To(Equal(2))
+		msSeqSuccess.End()
+
+		Expect(ExportIsServerSelectionError(nil)).To(BeFalse())
+		Expect(ExportIsServerSelectionError(errors.New("server selection timeout"))).To(BeTrue())
+		Expect(ExportIsServerSelectionError(errors.New("other error"))).To(BeFalse())
 
 		// Mock session with terminal non-retryable error (cached)
 		rawSess2, err := client.StartSession()

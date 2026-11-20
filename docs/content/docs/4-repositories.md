@@ -93,7 +93,7 @@ the field name and binds a compiled BSON query implementation to it.
 * **Multiple Entities:** `[]T` or `Stream[T]` (Note: `Stream[T]` buffers all matching documents into memory via `Find` before returning the stream for functional pipeline transformations).
 * **Aggregates / Existence:** `int64` (`CountBy...`, `DeleteBy...`), `bool` (`ExistsBy...`)
 * **Query Builder:** `*MongoQuery` (returns the compiled query prior to execution)
-* **Error Handling:** Append `Error` as a second return value (or sole return value for `DeleteBy...`). Single-result methods without an `Error` return (`*T`, `Optional[*T]`) return `nil` or an empty `Optional` on error; callers needing to distinguish failures from misses should declare an `(Optional[*T], Error)` or `(*T, Error)` signature.
+* **Error Handling:** Append `Error` as a second return value (or sole return value for `DeleteBy...`). Single-result methods without an `Error` return (`*T`, `Optional[*T]`) return `nil` or an empty `Optional` on error. Callers needing to distinguish failures from misses should declare an `(Optional[*T], Error)` or `(*T, Error)` signature: a derived query with no matching document returns a non-nil `NotFoundError`, while a database failure returns a `MongoError`; the `Optional` is empty in both cases. Inspect the error kind (`err.Name()`) to distinguish a query miss from a database failure.
 
 ## 3. Complete Example
 

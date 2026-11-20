@@ -51,7 +51,7 @@ func (s *OrderService) UpdateUserWithAudit(ctx context.Context, user *User) {
             return err // Triggers Rollback
         }
         if count == 0 {
-            return NewError("user not found")
+            return NewError("UserNotFoundError", "user not found")
         }
 
         if _, err := s.userRepo.Save(user); err != nil {

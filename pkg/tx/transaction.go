@@ -115,6 +115,13 @@ func isUnknownTransactionCommitResult(err error) bool {
 	return strings.Contains(err.Error(), "UnknownTransactionCommitResult")
 }
 
+func isServerSelectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "server selection")
+}
+
 // Commit commits the active MongoDB transaction on this session.
 func (this *MongoSession) Commit() Error {
 	if this == nil {
@@ -136,7 +143,13 @@ func (this *MongoSession) Commit() Error {
 	if err != nil && isUnknownTransactionCommitResult(err) && this.ctx.Err() != nil {
 		retryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		err = this.session.CommitTransaction(mongo.NewSessionContext(retryCtx, this.session))
+		if retryErr := this.session.CommitTransaction(mongo.NewSessionContext(retryCtx, this.session)); retryErr != nil {
+			if !isServerSelectionError(retryErr) {
+				err = retryErr
+			}
+		} else {
+			err = nil
+		}
 	}
 	if err != nil {
 		wrapped := NewWrappedError("TransactionError", err)

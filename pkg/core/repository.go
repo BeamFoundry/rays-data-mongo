@@ -393,26 +393,56 @@ func findIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
 	}
 
 	useJSON := len(useJSONTags) > 0 && useJSONTags[0]
-	t := v.Type()
-	// Prefer explicit bson:"_id" tag, then json:"_id" when UseJSONStructTags is enabled
-	for i := range t.NumField() {
-		field := t.Field(i)
-		if !field.IsExported() {
-			continue
-		}
-		bsonName, inline, skip := parseBSONTag(&field, useJSON)
-		if skip {
-			continue
-		}
-		if inline {
-			if sub := findIDField(v.Field(i), useJSON); sub.IsValid() {
-				return sub
+
+	currentLevel := []reflect.Value{v}
+	for len(currentLevel) > 0 {
+		var nextLevel []reflect.Value
+
+		// Phase 1: Check direct fields at current level.
+		// Shallowest field matching _id wins over deeper inline fields (dominance rule).
+		for _, cur := range currentLevel {
+			t := cur.Type()
+			for i := range t.NumField() {
+				field := t.Field(i)
+				if !field.IsExported() {
+					continue
+				}
+				bsonName, inline, skip := parseBSONTag(&field, useJSON)
+				if skip || inline {
+					continue
+				}
+				if bsonName == bsonIDField {
+					return cur.Field(i)
+				}
 			}
-			continue
 		}
-		if bsonName == bsonIDField {
-			return v.Field(i)
+
+		// Phase 2: If no direct _id field at this level, collect inline structs for next level.
+		for _, cur := range currentLevel {
+			t := cur.Type()
+			for i := range t.NumField() {
+				field := t.Field(i)
+				if !field.IsExported() {
+					continue
+				}
+				_, inline, skip := parseBSONTag(&field, useJSON)
+				if skip || !inline {
+					continue
+				}
+				sub := cur.Field(i)
+				for sub.Kind() == reflect.Pointer {
+					if sub.IsNil() {
+						break
+					}
+					sub = sub.Elem()
+				}
+				if sub.IsValid() && sub.Kind() == reflect.Struct {
+					nextLevel = append(nextLevel, sub)
+				}
+			}
 		}
+
+		currentLevel = nextLevel
 	}
 	// Untagged "ID" fields are intentionally not selected as identity because the MongoDB driver
 	// only serializes fields to "_id" if explicitly tagged with bson:"_id" (or json:"_id" with UseJSONStructTags).

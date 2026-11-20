@@ -63,3 +63,8 @@ func ExportParseBSONTag(field *reflect.StructField, useJSONTags ...bool) (name s
 func ExportCollectionUseJSONStructTags(coll *mongo.Collection) bool {
 	return collectionUseJSONStructTags(coll)
 }
+
+// ExportFindIDField exposes findIDField for testing.
+func ExportFindIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
+	return findIDField(v, useJSONTags...)
+}
