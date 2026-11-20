@@ -1,13 +1,15 @@
 package autoconfig
 
 import (
-	"go.mongodb.org/mongo-driver/mongo"
+	"context"
+
 	"go.mongodb.org/mongo-driver/mongo/options"
+
+	_ "github.com/BeamFoundry/rays" // rays
 
 	. "github.com/BeamFoundry/rays-data-mongo/pkg/tx"
 	. "github.com/BeamFoundry/rays-data-mongo/pkg/util"
 	. "github.com/BeamFoundry/rays/pkg/core"
-	. "github.com/BeamFoundry/rays/pkg/lang"
 )
 
 // MongoAutoConfig registers default [options.LogSink] and [MongoTransactional] Beams
@@ -28,19 +30,14 @@ func (this *MongoAutoConfig) MongoLogSink(
 	return MongoLogSink{}.New().WithLogger(this.logger)
 }
 
-// MongoTxManager provides the default [MongoTransactional] Beam backed by [MongoTransactionalManager].
+// MongoTxManager provides the default [MongoTransactional] Prototype Beam backed by [MongoTransactionalManager].
+//
+//nolint:revive // Rays Configuration methods require the anonymous condition struct as first argument
 func (this *MongoAutoConfig) MongoTxManager(
-	that struct {
+	_ struct {
 		ConditionalOnMissingBeam
-		client   Optional[*mongo.Client]   `@:"Inject"`
-		database Optional[*mongo.Database] `@:"Inject"`
 	},
-) (MongoTransactional, Error) {
-	if db, ok := that.database.Get(); ok && db != nil {
-		return NewMongoTransactionalManager(db.Client(), this.logger), nil
-	}
-	if c, ok := that.client.Get(); ok && c != nil {
-		return NewMongoTransactionalManager(c, this.logger), nil
-	}
-	return nil, NewError("MongoConfigurationError", "No *mongo.Client or *mongo.Database Beam available to configure MongoTransactional")
+	_ context.Context,
+) MongoTransactional {
+	return MongoTransactionalManager{}.New()
 }
