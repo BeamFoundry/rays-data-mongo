@@ -282,6 +282,77 @@ type CannotRetainRepo struct {
 	MongoRepository[CannotRetainEntity, string]
 }
 
+type InlineIntBaseID struct {
+	ID int `bson:"_id,omitempty"`
+}
+
+type InlinePtrIntEntity struct {
+	Base *InlineIntBaseID `bson:",inline"`
+	Name string           `bson:"name"`
+}
+
+type InlinePtrIntRepo struct {
+	MongoRepository[InlinePtrIntEntity, int]
+}
+
+type ExplicitZeroBase struct {
+	ID int `bson:"_id"`
+}
+
+type ExplicitZeroEntity struct {
+	Base *ExplicitZeroBase `bson:",inline"`
+	Name string            `bson:"name"`
+}
+
+type ExplicitZeroRepo struct {
+	MongoRepository[ExplicitZeroEntity, int]
+}
+
+type MismatchedIDEntity struct {
+	ID primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (m *MismatchedIDEntity) MarshalBSON() ([]byte, error) {
+	if m.ID.IsZero() {
+		return bson.Marshal(bson.M{"name": "mismatched"})
+	}
+	return bson.Marshal(bson.M{"_id": primitive.NewObjectID()})
+}
+
+type MismatchedIDRepo struct {
+	MongoRepository[MismatchedIDEntity, primitive.ObjectID]
+}
+
+type MissingIDEntity struct {
+	ID primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (*MissingIDEntity) MarshalBSON() ([]byte, error) {
+	return bson.Marshal(bson.M{"name": "missing-id"})
+}
+
+type MissingIDRepo struct {
+	MongoRepository[MissingIDEntity, primitive.ObjectID]
+}
+
+type ErrorMarshalEntity struct {
+	Base *InlineBaseID `bson:",inline"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (e *ErrorMarshalEntity) MarshalBSON() ([]byte, error) {
+	if e.Base == nil || e.Base.ID.IsZero() {
+		return bson.Marshal(bson.M{"name": "error-marshal"})
+	}
+	return nil, errors.New("marshal failure")
+}
+
+type ErrorMarshalRepo struct {
+	MongoRepository[ErrorMarshalEntity, primitive.ObjectID]
+}
+
 type DescEntity struct {
 	Name        string             `bson:"name"`
 	Description string             `bson:"description"`
@@ -657,6 +728,11 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			ascFieldRepo     *AscFieldRepo
 			inlinePtrRepo    *InlinePtrRepo
 			cannotRetainRepo *CannotRetainRepo
+			inlinePtrIntRepo *InlinePtrIntRepo
+			explicitZeroRepo *ExplicitZeroRepo
+			mismatchedRepo   *MismatchedIDRepo
+			missingIDRepo    *MissingIDRepo
+			errorMarshalRepo *ErrorMarshalRepo
 			txMgr            MongoTransactional
 			db               *mongo.Database
 			client           *mongo.Client
@@ -688,6 +764,11 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			ascFieldRepo = &AscFieldRepo{}
 			inlinePtrRepo = &InlinePtrRepo{}
 			cannotRetainRepo = &CannotRetainRepo{}
+			inlinePtrIntRepo = &InlinePtrIntRepo{}
+			explicitZeroRepo = &ExplicitZeroRepo{}
+			mismatchedRepo = &MismatchedIDRepo{}
+			missingIDRepo = &MissingIDRepo{}
+			errorMarshalRepo = &ErrorMarshalRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
@@ -718,6 +799,11 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(ascFieldRepo)
 			AddBeamFor(inlinePtrRepo)
 			AddBeamFor(cannotRetainRepo)
+			AddBeamFor(inlinePtrIntRepo)
+			AddBeamFor(explicitZeroRepo)
+			AddBeamFor(mismatchedRepo)
+			AddBeamFor(missingIDRepo)
+			AddBeamFor(errorMarshalRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -2077,6 +2163,18 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(savedSolePtrs[1].Base).NotTo(BeNil())
 			Expect(savedSolePtrs[1].Base.ID.IsZero()).To(BeFalse())
 
+			foundSole, okSole := inlinePtrRepo.FindById(savedSolePtr.Base.ID).Get()
+			Expect(okSole).To(BeTrue())
+			Expect(foundSole.Name).To(Equal("sole-ptr-save"))
+
+			foundBulk1, okBulk1 := inlinePtrRepo.FindById(savedSolePtrs[0].Base.ID).Get()
+			Expect(okBulk1).To(BeTrue())
+			Expect(foundBulk1.Name).To(Equal("sole-ptr-bulk-1"))
+
+			foundBulk2, okBulk2 := inlinePtrRepo.FindById(savedSolePtrs[1].Base.ID).Get()
+			Expect(okBulk2).To(BeTrue())
+			Expect(foundBulk2.Name).To(Equal("sole-ptr-bulk-2"))
+
 			Expect(inlinePtrRepo.Delete(savedSolePtr)).NotTo(HaveOccurred())
 			for _, d := range savedSolePtrs {
 				Expect(inlinePtrRepo.Delete(d)).NotTo(HaveOccurred())
@@ -2088,6 +2186,61 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(cannotRetainErr.Name()).To(Equal("IllegalArgumentError"))
 			Expect(cannotRetainErr.Error()).To(ContainSubstring("Entity does not have a settable _id field to retain generated ID in Save"))
 
+			// Inline pointer with unsupported ID type is not allocated; leaves object unchanged
+			ptrIntEnt := &InlinePtrIntEntity{Name: "nil-base-int"}
+			_, ptrIntErr := inlinePtrIntRepo.Save(ptrIntEnt)
+			Expect(ptrIntErr).To(HaveOccurred())
+			Expect(ptrIntErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(ptrIntEnt.Base).To(BeNil())
+
+			// Retry rejected save leaves object unchanged and cannot encode unintended _id: 0
+			_, retryErr := inlinePtrIntRepo.Save(ptrIntEnt)
+			Expect(retryErr).To(HaveOccurred())
+			Expect(ptrIntEnt.Base).To(BeNil())
+
+			// Explicit zero ID is upserted as-is
+			explicitZero := &ExplicitZeroEntity{Base: &ExplicitZeroBase{ID: 0}, Name: "zero-val"}
+			savedZero, err := explicitZeroRepo.Save(explicitZero)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(savedZero.Base.ID).To(Equal(0))
+			foundZero, okZero := explicitZeroRepo.FindById(0).Get()
+			Expect(okZero).To(BeTrue())
+			Expect(foundZero.Name).To(Equal("zero-val"))
+			Expect(explicitZeroRepo.Delete(explicitZero)).NotTo(HaveOccurred())
+
+			// SaveAll undoes allocated pointers if validation fails
+			batchEnts := []*InlinePtrEntity{{Name: "allocated-and-undone"}, nil}
+			_, saveAllNilErr := inlinePtrRepo.SaveAll(batchEnts)
+			Expect(saveAllNilErr).To(HaveOccurred())
+			Expect(batchEnts[0].Base).To(BeNil())
+
+			// Marshal failure on keyless entity in Save and SaveAll
+			errMarshalEnt := &ErrorMarshalEntity{}
+			_, errMarshalSaveErr := errorMarshalRepo.Save(errMarshalEnt)
+			Expect(errMarshalSaveErr).To(HaveOccurred())
+			Expect(errMarshalEnt.Base).To(BeNil())
+
+			_, errMarshalBulkErr := errorMarshalRepo.SaveAll([]*ErrorMarshalEntity{{}})
+			Expect(errMarshalBulkErr).To(HaveOccurred())
+
+			// Mismatched ID in Save and SaveAll
+			_, mismatchSaveErr := mismatchedRepo.Save(&MismatchedIDEntity{})
+			Expect(mismatchSaveErr).To(HaveOccurred())
+			Expect(mismatchSaveErr.Name()).To(Equal("IllegalArgumentError"))
+
+			_, mismatchBulkErr := mismatchedRepo.SaveAll([]*MismatchedIDEntity{{}})
+			Expect(mismatchBulkErr).To(HaveOccurred())
+			Expect(mismatchBulkErr.Name()).To(Equal("IllegalArgumentError"))
+
+			// Missing ID in Save and SaveAll
+			_, missingSaveErr := missingIDRepo.Save(&MissingIDEntity{})
+			Expect(missingSaveErr).To(HaveOccurred())
+			Expect(missingSaveErr.Name()).To(Equal("IllegalArgumentError"))
+
+			_, missingBulkErr := missingIDRepo.SaveAll([]*MissingIDEntity{{}})
+			Expect(missingBulkErr).To(HaveOccurred())
+			Expect(missingBulkErr.Name()).To(Equal("IllegalArgumentError"))
+
 			// Conflicting inline pointer entity: shallower ID wins without initializing nil Base pointer
 			confPtrEntity := &ConflictingInlinePtrEntity{Base: nil}
 			confPtrIDField := ExportFindIDField(reflect.ValueOf(confPtrEntity), false, true)
@@ -2098,6 +2251,33 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			// Unaddressable inline pointer entity returns invalid field when initializing path
 			unaddrVal := ExportFindIDField(reflect.ValueOf(InlinePtrEntity{}), false, true)
 			Expect(unaddrVal.IsValid()).To(BeFalse())
+			Expect(ExportFindIDField(reflect.ValueOf((*InlinePtrEntity)(nil)), false, true).IsValid()).To(BeFalse())
+			Expect(ExportFindIDField(reflect.ValueOf("str"), false, true).IsValid()).To(BeFalse())
+
+			// Helper branches
+			Expect(ExportSupportsGeneratedID(nil)).To(BeFalse())
+			Expect(ExportSupportsGeneratedID(reflect.TypeFor[int]())).To(BeFalse())
+			Expect(ExportSupportsGeneratedID(reflect.TypeFor[primitive.ObjectID]())).To(BeTrue())
+			Expect(ExportSupportsGeneratedID(reflect.TypeFor[*primitive.ObjectID]())).To(BeTrue())
+
+			_, ok = ExportExtractObjectID(reflect.Value{})
+			Expect(ok).To(BeFalse())
+			var nilOidPtr *primitive.ObjectID
+			_, ok = ExportExtractObjectID(reflect.ValueOf(nilOidPtr))
+			Expect(ok).To(BeFalse())
+			nonOidStr := "str"
+			_, ok = ExportExtractObjectID(reflect.ValueOf(&nonOidStr))
+			Expect(ok).To(BeFalse())
+			_, ok = ExportExtractObjectID(reflect.ValueOf(nonOidStr))
+			Expect(ok).To(BeFalse())
+			oidVal := primitive.NewObjectID()
+			extrOid, ok := ExportExtractObjectID(reflect.ValueOf(&oidVal))
+			Expect(ok).To(BeTrue())
+			Expect(extrOid).To(Equal(oidVal))
+
+			ExportUndoAllocations([]reflect.Value{{}})
+			Expect(ExportTerminalIDType(reflect.TypeFor[InlinePtrEntity](), []int{0, 0})).To(Equal(reflect.TypeFor[primitive.ObjectID]()))
+			Expect(ExportTerminalIDType(reflect.TypeFor[string](), nil)).To(BeNil())
 
 			// Non-struct type for ExportFindIDPath returns nil
 			Expect(ExportFindIDPath(reflect.TypeFor[string](), false)).To(BeNil())
@@ -2109,6 +2289,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(userRepo.Delete(&User{ID: primitive.NewObjectID()})).To(HaveOccurred())
 			Expect(userRepo.DeleteById(primitive.NewObjectID())).To(HaveOccurred())
 			_, err = userRepo.Save(&User{ID: primitive.NewObjectID()})
+			Expect(err).To(HaveOccurred())
+			_, err = userRepo.Save(&User{Name: "insert-fail-keyless"})
 			Expect(err).To(HaveOccurred())
 			_, err = noIDRepo.Save(&NoIDEntity{Name: "insert-fail"})
 			Expect(err).To(HaveOccurred())

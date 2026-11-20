@@ -5,6 +5,7 @@ import (
 	"reflect"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 
 	. "github.com/BeamFoundry/rays/pkg/lang"
@@ -72,4 +73,24 @@ func ExportFindIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
 // ExportFindIDPath exposes findIDPath for testing.
 func ExportFindIDPath(t reflect.Type, useJSON bool) []int {
 	return findIDPath(t, useJSON)
+}
+
+// ExportExtractObjectID exposes extractObjectID for testing.
+func ExportExtractObjectID(idField reflect.Value) (primitive.ObjectID, bool) {
+	return extractObjectID(idField)
+}
+
+// ExportUndoAllocations exposes undoAllocations for testing.
+func ExportUndoAllocations(allocated []reflect.Value) {
+	undoAllocations(allocated)
+}
+
+// ExportTerminalIDType exposes terminalIDType for testing.
+func ExportTerminalIDType(t reflect.Type, path []int) reflect.Type {
+	return terminalIDType(t, path)
+}
+
+// ExportSupportsGeneratedID exposes supportsGeneratedID for testing.
+func ExportSupportsGeneratedID(t reflect.Type) bool {
+	return supportsGeneratedID(t)
 }

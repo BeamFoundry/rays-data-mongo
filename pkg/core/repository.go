@@ -231,7 +231,10 @@ func (this *MongoRepository[T, K]) DeleteById(id K) Error {
 }
 
 // Save inserts a new document or upserts an existing one by its _id field.
-// If the _id field is a zero [primitive.ObjectID], a new ObjectID is generated and assigned to object.
+// ID generation depends on the _id field's Go type: zero [primitive.ObjectID] and
+// *[primitive.ObjectID] fields receive a generated ObjectID; other field types with
+// omitted serialized _id values return IllegalArgumentError without writing, while
+// explicit zero values are upserted as-is.
 func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	if object == nil {
 		return nil, NewError("IllegalArgumentError", "Cannot save nil entity")
@@ -260,25 +263,39 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 
 	useJSON := collectionUseJSONStructTags(coll)
 	hasIDPath := len(findIDPath(reflect.TypeOf(object), useJSON)) > 0
+	if !hasIDPath {
+		if _, driverErr := coll.InsertOne(ctx, object); driverErr != nil {
+			return nil, NewWrappedError("MongoError", driverErr)
+		}
+		return object, nil
+	}
 
 	idField := st.field
-	if !idField.IsValid() && hasIDPath {
-		idField = findIDField(reflect.ValueOf(object), useJSON, true)
+	var allocated []reflect.Value
+	if !idField.IsValid() {
+		idField, allocated = initIDField(reflect.ValueOf(object), useJSON)
 	}
-	if hasIDPath && !assignGeneratedID(idField) {
+
+	if !assignGeneratedID(idField) {
+		undoAllocations(allocated)
 		return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in Save")
 	}
-	st.field = idField
 
-	res, driverErr := coll.InsertOne(ctx, object)
-	if driverErr != nil {
-		return nil, NewWrappedError("MongoError", driverErr)
+	docBytes, encErr := marshalWithCollection(coll, object)
+	if encErr != nil {
+		undoAllocations(allocated)
+		return nil, NewWrappedError("MongoError", encErr)
 	}
-	if st.field.IsValid() && st.field.CanSet() && res.InsertedID != nil {
-		insertedVal := reflect.ValueOf(res.InsertedID)
-		if insertedVal.Type().AssignableTo(st.field.Type()) {
-			st.field.Set(insertedVal)
-		}
+
+	assignedOID, ok := extractObjectID(idField)
+	rawVal, lookupErr := bson.Raw(docBytes).LookupErr(bsonIDField)
+	if !ok || lookupErr != nil || rawVal.Type != bson.TypeObjectID || rawVal.ObjectID() != assignedOID {
+		undoAllocations(allocated)
+		return nil, NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in Save")
+	}
+
+	if _, driverErr := coll.InsertOne(ctx, bson.Raw(docBytes)); driverErr != nil {
+		return nil, NewWrappedError("MongoError", driverErr)
 	}
 	return object, nil
 }
@@ -297,13 +314,18 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 	if coll == nil {
 		return nil, NewError("MongoConfigurationError", "Database is not configured for repository")
 	}
+
+	useJSON := collectionUseJSONStructTags(coll)
+	var allAllocated []reflect.Value
 	models := make([]mongo.WriteModel, 0, len(objects))
 	for _, object := range objects {
 		if object == nil {
+			undoAllocations(allAllocated)
 			return nil, NewError("IllegalArgumentError", "Cannot save nil entity in SaveAll")
 		}
 		st, encodeErr := entityIDStatus(coll, object)
 		if encodeErr != nil {
+			undoAllocations(allAllocated)
 			return nil, encodeErr
 		}
 		if st.hasEncoded {
@@ -314,12 +336,26 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 		} else {
 			idField := st.field
 			if !idField.IsValid() {
-				idField = findIDField(reflect.ValueOf(object), collectionUseJSONStructTags(coll), true)
+				var allocated []reflect.Value
+				idField, allocated = initIDField(reflect.ValueOf(object), useJSON)
+				allAllocated = append(allAllocated, allocated...)
 			}
 			if !assignGeneratedID(idField) {
+				undoAllocations(allAllocated)
 				return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in SaveAll")
 			}
-			models = append(models, mongo.NewInsertOneModel().SetDocument(object))
+			assignedOID, ok := extractObjectID(idField)
+			docBytes, encErr := marshalWithCollection(coll, object)
+			if encErr != nil {
+				undoAllocations(allAllocated)
+				return nil, NewWrappedError("MongoError", encErr)
+			}
+			rawVal, lookupErr := bson.Raw(docBytes).LookupErr(bsonIDField)
+			if !ok || lookupErr != nil || rawVal.Type != bson.TypeObjectID || rawVal.ObjectID() != assignedOID {
+				undoAllocations(allAllocated)
+				return nil, NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in SaveAll")
+			}
+			models = append(models, mongo.NewInsertOneModel().SetDocument(bson.Raw(docBytes)))
 		}
 	}
 
@@ -466,7 +502,97 @@ func findIDPath(t reflect.Type, useJSON bool) []int {
 	return nil
 }
 
+func terminalIDType(t reflect.Type, path []int) reflect.Type {
+	cur := t
+	for k, idx := range path {
+		for cur.Kind() == reflect.Pointer {
+			cur = cur.Elem()
+		}
+		field := cur.Field(idx)
+		if k == len(path)-1 {
+			return field.Type
+		}
+		cur = field.Type
+	}
+	return nil
+}
+
+func supportsGeneratedID(t reflect.Type) bool {
+	if t == nil {
+		return false
+	}
+	return objectIDType.AssignableTo(t) || reflect.PointerTo(objectIDType).AssignableTo(t)
+}
+
+func undoAllocations(allocated []reflect.Value) {
+	for _, ptr := range allocated {
+		if ptr.IsValid() && ptr.CanSet() {
+			ptr.Set(reflect.Zero(ptr.Type()))
+		}
+	}
+}
+
+func extractObjectID(idField reflect.Value) (primitive.ObjectID, bool) {
+	if !idField.IsValid() {
+		return primitive.NilObjectID, false
+	}
+	if idField.Kind() == reflect.Pointer {
+		if idField.IsNil() {
+			return primitive.NilObjectID, false
+		}
+		if oid, ok := idField.Elem().Interface().(primitive.ObjectID); ok {
+			return oid, true
+		}
+		return primitive.NilObjectID, false
+	}
+	if oid, ok := idField.Interface().(primitive.ObjectID); ok {
+		return oid, true
+	}
+	return primitive.NilObjectID, false
+}
+
+func initIDField(v reflect.Value, useJSON bool) (idField reflect.Value, allocated []reflect.Value) {
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return reflect.Value{}, nil
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return reflect.Value{}, nil
+	}
+
+	path := findIDPath(v.Type(), useJSON)
+	cur := v
+	for k, idx := range path {
+		if k == len(path)-1 {
+			return cur.Field(idx), allocated
+		}
+		sub := cur.Field(idx)
+		if sub.Kind() == reflect.Pointer {
+			if sub.IsNil() {
+				if !sub.CanSet() || !supportsGeneratedID(terminalIDType(v.Type(), path)) {
+					return reflect.Value{}, nil
+				}
+				sub.Set(reflect.New(sub.Type().Elem()))
+				allocated = append(allocated, sub)
+			}
+			sub = sub.Elem()
+		}
+		cur = sub
+	}
+
+	return reflect.Value{}, nil
+}
+
 func findIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
+	useJSON := len(useJSONTags) > 0 && useJSONTags[0]
+	initializePath := len(useJSONTags) > 1 && useJSONTags[1]
+	if initializePath {
+		field, _ := initIDField(v, useJSON)
+		return field
+	}
+
 	for v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return reflect.Value{}
@@ -477,9 +603,6 @@ func findIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
 		return reflect.Value{}
 	}
 
-	useJSON := len(useJSONTags) > 0 && useJSONTags[0]
-	initializePath := len(useJSONTags) > 1 && useJSONTags[1]
-
 	path := findIDPath(v.Type(), useJSON)
 	cur := v
 	for k, idx := range path {
@@ -489,10 +612,7 @@ func findIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
 		sub := cur.Field(idx)
 		if sub.Kind() == reflect.Pointer {
 			if sub.IsNil() {
-				if !initializePath || !sub.CanSet() {
-					return reflect.Value{}
-				}
-				sub.Set(reflect.New(sub.Type().Elem()))
+				return reflect.Value{}
 			}
 			sub = sub.Elem()
 		}
@@ -613,6 +733,11 @@ func entityIDStatus(coll *mongo.Collection, object any) (idStatus, Error) {
 	return idStatus{field: idField, val: decodedID, docBytes: rawBytes, hasEncoded: true}, nil
 }
 
+// assignGeneratedID sets a newly generated ObjectID on idField if its Go type supports
+// generated IDs. ID generation depends on the _id field's Go type: zero [primitive.ObjectID]
+// and *[primitive.ObjectID] fields receive a generated ObjectID; other field types with
+// omitted serialized _id values return IllegalArgumentError without writing, while
+// explicit zero values are upserted as-is.
 func assignGeneratedID(idField reflect.Value) bool {
 	if !idField.IsValid() || !idField.CanSet() {
 		return false
