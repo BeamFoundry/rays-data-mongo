@@ -283,7 +283,7 @@ type CannotRetainRepo struct {
 }
 
 type InlineIntBaseID struct {
-	ID int `bson:"_id,omitempty"`
+	ID int `bson:"_id"`
 }
 
 type InlinePtrIntEntity struct {
@@ -351,6 +351,61 @@ func (e *ErrorMarshalEntity) MarshalBSON() ([]byte, error) {
 
 type ErrorMarshalRepo struct {
 	MongoRepository[ErrorMarshalEntity, primitive.ObjectID]
+}
+
+type MutatingRetainedIDEntity struct {
+	ID primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (m *MutatingRetainedIDEntity) MarshalBSON() ([]byte, error) {
+	if m.ID.IsZero() {
+		return bson.Marshal(bson.M{"name": "mutating-retained"})
+	}
+	encodedID := m.ID
+	m.ID = primitive.NewObjectID()
+	return bson.Marshal(bson.M{"_id": encodedID})
+}
+
+type MutatingRetainedIDRepo struct {
+	MongoRepository[MutatingRetainedIDEntity, primitive.ObjectID]
+}
+
+type PreservedMarshalerEntity struct {
+	Name string             `bson:"name"`
+	ID   primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (p *PreservedMarshalerEntity) MarshalBSON() ([]byte, error) {
+	if p.ID.IsZero() {
+		return bson.Marshal(bson.M{"name": p.Name})
+	}
+	return bson.Marshal(bson.M{"_id": p.ID, "name": p.Name})
+}
+
+type PreservedMarshalerRepo struct {
+	MongoRepository[PreservedMarshalerEntity, primitive.ObjectID]
+}
+
+type ConditionalMismatchEntity struct {
+	ID         primitive.ObjectID `bson:"_id,omitempty"`
+	ShouldFail bool               `bson:"should_fail"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (c *ConditionalMismatchEntity) MarshalBSON() ([]byte, error) {
+	if c.ID.IsZero() {
+		return bson.Marshal(bson.M{"should_fail": c.ShouldFail})
+	}
+	if c.ShouldFail {
+		return bson.Marshal(bson.M{"_id": primitive.NewObjectID(), "should_fail": true})
+	}
+	return bson.Marshal(bson.M{"_id": c.ID, "should_fail": false})
+}
+
+type ConditionalMismatchRepo struct {
+	MongoRepository[ConditionalMismatchEntity, primitive.ObjectID]
 }
 
 type DescEntity struct {
@@ -703,39 +758,42 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 
 	Context("Core Query, Repository, Builder, and Session Edge Cases", func() {
 		var (
-			richRepo         *RichRepository
-			cyclicRepo       *CyclicRepository
-			ptrNameRepo      *PtrNamerRepository
-			boxRepo          *BoxRepository
-			catRepo          *CategoryRepository
-			boyRepo          *BoyRepository
-			anyRepo          *AnyIDRepository
-			noIDRepo         *NoIDRepository
-			anonRepo         *AnonRepository
-			ptrEntRepo       *PtrEntityRepository
-			primRepo         *PrimitiveEntityRepository
-			userRepo         *UserRepository
-			likeRepo         *LikeRepo
-			inlineNoIDRepo   *InlineNoIDRepository
-			workOrderRepo    *WorkOrderRepo
-			intIDRepo        *IntIDRepo
-			ptrIDRepo        *PtrIDRepo
-			teamRepo         *TeamOrderRepo
-			badMarshalRepo   *BadMarshalRepo
-			nilOIDRepo       *NilOIDRepo
-			inlineMapRepo    *InlineMapRepo
-			descRepo         *DescRepo
-			ascFieldRepo     *AscFieldRepo
-			inlinePtrRepo    *InlinePtrRepo
-			cannotRetainRepo *CannotRetainRepo
-			inlinePtrIntRepo *InlinePtrIntRepo
-			explicitZeroRepo *ExplicitZeroRepo
-			mismatchedRepo   *MismatchedIDRepo
-			missingIDRepo    *MissingIDRepo
-			errorMarshalRepo *ErrorMarshalRepo
-			txMgr            MongoTransactional
-			db               *mongo.Database
-			client           *mongo.Client
+			richRepo                *RichRepository
+			cyclicRepo              *CyclicRepository
+			ptrNameRepo             *PtrNamerRepository
+			boxRepo                 *BoxRepository
+			catRepo                 *CategoryRepository
+			boyRepo                 *BoyRepository
+			anyRepo                 *AnyIDRepository
+			noIDRepo                *NoIDRepository
+			anonRepo                *AnonRepository
+			ptrEntRepo              *PtrEntityRepository
+			primRepo                *PrimitiveEntityRepository
+			userRepo                *UserRepository
+			likeRepo                *LikeRepo
+			inlineNoIDRepo          *InlineNoIDRepository
+			workOrderRepo           *WorkOrderRepo
+			intIDRepo               *IntIDRepo
+			ptrIDRepo               *PtrIDRepo
+			teamRepo                *TeamOrderRepo
+			badMarshalRepo          *BadMarshalRepo
+			nilOIDRepo              *NilOIDRepo
+			inlineMapRepo           *InlineMapRepo
+			descRepo                *DescRepo
+			ascFieldRepo            *AscFieldRepo
+			inlinePtrRepo           *InlinePtrRepo
+			cannotRetainRepo        *CannotRetainRepo
+			inlinePtrIntRepo        *InlinePtrIntRepo
+			explicitZeroRepo        *ExplicitZeroRepo
+			mismatchedRepo          *MismatchedIDRepo
+			missingIDRepo           *MissingIDRepo
+			errorMarshalRepo        *ErrorMarshalRepo
+			mutatingRetainedRepo    *MutatingRetainedIDRepo
+			preservedMarshalerRepo  *PreservedMarshalerRepo
+			conditionalMismatchRepo *ConditionalMismatchRepo
+			txMgr                   MongoTransactional
+			db                      *mongo.Database
+			client                  *mongo.Client
 		)
 
 		BeforeEach(func() {
@@ -769,6 +827,9 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			mismatchedRepo = &MismatchedIDRepo{}
 			missingIDRepo = &MissingIDRepo{}
 			errorMarshalRepo = &ErrorMarshalRepo{}
+			mutatingRetainedRepo = &MutatingRetainedIDRepo{}
+			preservedMarshalerRepo = &PreservedMarshalerRepo{}
+			conditionalMismatchRepo = &ConditionalMismatchRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
@@ -804,6 +865,9 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(mismatchedRepo)
 			AddBeamFor(missingIDRepo)
 			AddBeamFor(errorMarshalRepo)
+			AddBeamFor(mutatingRetainedRepo)
+			AddBeamFor(preservedMarshalerRepo)
+			AddBeamFor(conditionalMismatchRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -2224,22 +2288,69 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(errMarshalBulkErr).To(HaveOccurred())
 
 			// Mismatched ID in Save and SaveAll
-			_, mismatchSaveErr := mismatchedRepo.Save(&MismatchedIDEntity{})
+			mismatchedEnt := &MismatchedIDEntity{}
+			_, mismatchSaveErr := mismatchedRepo.Save(mismatchedEnt)
 			Expect(mismatchSaveErr).To(HaveOccurred())
 			Expect(mismatchSaveErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(mismatchedEnt.ID.IsZero()).To(BeTrue())
 
-			_, mismatchBulkErr := mismatchedRepo.SaveAll([]*MismatchedIDEntity{{}})
+			mismatchedBulkEnt := &MismatchedIDEntity{}
+			_, mismatchBulkErr := mismatchedRepo.SaveAll([]*MismatchedIDEntity{mismatchedBulkEnt})
 			Expect(mismatchBulkErr).To(HaveOccurred())
 			Expect(mismatchBulkErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(mismatchedBulkEnt.ID.IsZero()).To(BeTrue())
 
 			// Missing ID in Save and SaveAll
-			_, missingSaveErr := missingIDRepo.Save(&MissingIDEntity{})
+			missingEnt := &MissingIDEntity{}
+			_, missingSaveErr := missingIDRepo.Save(missingEnt)
 			Expect(missingSaveErr).To(HaveOccurred())
 			Expect(missingSaveErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(missingEnt.ID.IsZero()).To(BeTrue())
 
-			_, missingBulkErr := missingIDRepo.SaveAll([]*MissingIDEntity{{}})
+			missingBulkEnt := &MissingIDEntity{}
+			_, missingBulkErr := missingIDRepo.SaveAll([]*MissingIDEntity{missingBulkEnt})
 			Expect(missingBulkErr).To(HaveOccurred())
 			Expect(missingBulkErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(missingBulkEnt.ID.IsZero()).To(BeTrue())
+
+			// Custom marshaler leaving and encoding generated ID unchanged
+			preservedEnt := &PreservedMarshalerEntity{Name: "preserved-save"}
+			savedPreserved, errPreserved := preservedMarshalerRepo.Save(preservedEnt)
+			Expect(errPreserved).NotTo(HaveOccurred())
+			Expect(savedPreserved.ID.IsZero()).To(BeFalse())
+			foundPreserved, okPreserved := preservedMarshalerRepo.FindById(savedPreserved.ID).Get()
+			Expect(okPreserved).To(BeTrue())
+			Expect(foundPreserved.Name).To(Equal("preserved-save"))
+			Expect(preservedMarshalerRepo.Delete(savedPreserved)).NotTo(HaveOccurred())
+
+			bulkPreserved, errBulkPreserved := preservedMarshalerRepo.SaveAll([]*PreservedMarshalerEntity{
+				{Name: "preserved-bulk-1"},
+				{Name: "preserved-bulk-2"},
+			})
+			Expect(errBulkPreserved).NotTo(HaveOccurred())
+			Expect(bulkPreserved).To(HaveLen(2))
+			for _, p := range bulkPreserved {
+				Expect(p.ID.IsZero()).To(BeFalse())
+				Expect(preservedMarshalerRepo.Delete(p)).NotTo(HaveOccurred())
+			}
+
+			// Custom marshaler mutating retained ID is rejected and restored
+			mutatingEnt := &MutatingRetainedIDEntity{}
+			_, mutatingSaveErr := mutatingRetainedRepo.Save(mutatingEnt)
+			Expect(mutatingSaveErr).To(HaveOccurred())
+			Expect(mutatingSaveErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(mutatingEnt.ID.IsZero()).To(BeTrue())
+
+			// SaveAll rolls back earlier entries when later entry fails validation
+			condSlice := []*ConditionalMismatchEntity{
+				{ShouldFail: false},
+				{ShouldFail: true},
+			}
+			_, condBulkErr := conditionalMismatchRepo.SaveAll(condSlice)
+			Expect(condBulkErr).To(HaveOccurred())
+			Expect(condBulkErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(condSlice[0].ID.IsZero()).To(BeTrue())
+			Expect(condSlice[1].ID.IsZero()).To(BeTrue())
 
 			// Conflicting inline pointer entity: shallower ID wins without initializing nil Base pointer
 			confPtrEntity := &ConflictingInlinePtrEntity{Base: nil}
@@ -2276,6 +2387,14 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(extrOid).To(Equal(oidVal))
 
 			ExportUndoAllocations([]reflect.Value{{}})
+			ExportRollbackMutations([]ExportEntityMutation{
+				ExportNewEntityMutation(nil, reflect.Value{}, reflect.Value{}),
+				ExportNewEntityMutation(nil, reflect.ValueOf("immutable"), reflect.Value{}),
+			})
+			rawDocBytes, rawDocErr := ExportRawDocument([]byte{5, 0, 0, 0, 0}).MarshalBSON()
+			Expect(rawDocErr).NotTo(HaveOccurred())
+			Expect(rawDocBytes).To(Equal([]byte{5, 0, 0, 0, 0}))
+
 			Expect(ExportTerminalIDType(reflect.TypeFor[InlinePtrEntity](), []int{0, 0})).To(Equal(reflect.TypeFor[primitive.ObjectID]()))
 			Expect(ExportTerminalIDType(reflect.TypeFor[string](), nil)).To(BeNil())
 
@@ -2290,12 +2409,19 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(userRepo.DeleteById(primitive.NewObjectID())).To(HaveOccurred())
 			_, err = userRepo.Save(&User{ID: primitive.NewObjectID()})
 			Expect(err).To(HaveOccurred())
-			_, err = userRepo.Save(&User{Name: "insert-fail-keyless"})
+
+			disconnectUser := &User{Name: "insert-fail-keyless"}
+			_, err = userRepo.Save(disconnectUser)
 			Expect(err).To(HaveOccurred())
+			Expect(disconnectUser.ID.IsZero()).To(BeFalse())
+
 			_, err = noIDRepo.Save(&NoIDEntity{Name: "insert-fail"})
 			Expect(err).To(HaveOccurred())
-			_, err = userRepo.SaveAll([]*User{{Name: "bulk-fail"}})
+
+			disconnectBulkUser := &User{Name: "bulk-fail"}
+			_, err = userRepo.SaveAll([]*User{disconnectBulkUser})
 			Expect(err).To(HaveOccurred())
+			Expect(disconnectBulkUser.ID.IsZero()).To(BeFalse())
 		})
 	})
 })

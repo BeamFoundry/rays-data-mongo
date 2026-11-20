@@ -94,3 +94,23 @@ func ExportTerminalIDType(t reflect.Type, path []int) reflect.Type {
 func ExportSupportsGeneratedID(t reflect.Type) bool {
 	return supportsGeneratedID(t)
 }
+
+// ExportEntityMutation exposes entityMutation for testing.
+type ExportEntityMutation = entityMutation
+
+// ExportNewEntityMutation creates an ExportEntityMutation for testing.
+func ExportNewEntityMutation(allocated []reflect.Value, idField, origID reflect.Value) ExportEntityMutation {
+	return entityMutation{
+		idField:   idField,
+		origID:    origID,
+		allocated: allocated,
+	}
+}
+
+// ExportRollbackMutations exposes rollbackMutations for testing.
+func ExportRollbackMutations(mutations []ExportEntityMutation) {
+	rollbackMutations(mutations)
+}
+
+// ExportRawDocument exposes rawDocument for testing.
+type ExportRawDocument = rawDocument

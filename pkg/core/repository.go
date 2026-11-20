@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"reflect"
+	"slices"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -264,7 +265,7 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	useJSON := collectionUseJSONStructTags(coll)
 	hasIDPath := len(findIDPath(reflect.TypeOf(object), useJSON)) > 0
 	if !hasIDPath {
-		if _, driverErr := coll.InsertOne(ctx, object); driverErr != nil {
+		if _, driverErr := coll.InsertOne(ctx, bson.Raw(st.docBytes)); driverErr != nil {
 			return nil, NewWrappedError("MongoError", driverErr)
 		}
 		return object, nil
@@ -276,25 +277,41 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 		idField, allocated = initIDField(reflect.ValueOf(object), useJSON)
 	}
 
+	var origID reflect.Value
+	if idField.IsValid() {
+		if idField.Kind() == reflect.Pointer && idField.IsNil() {
+			origID = reflect.Zero(idField.Type())
+		} else {
+			origID = reflect.ValueOf(idField.Interface())
+		}
+	}
+
 	if !assignGeneratedID(idField) {
 		undoAllocations(allocated)
 		return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in Save")
 	}
 
+	mutation := entityMutation{
+		allocated: allocated,
+		idField:   idField,
+		origID:    origID,
+	}
+
+	generatedOID, ok := extractObjectID(idField)
 	docBytes, encErr := marshalWithCollection(coll, object)
 	if encErr != nil {
-		undoAllocations(allocated)
+		rollbackMutations([]entityMutation{mutation})
 		return nil, NewWrappedError("MongoError", encErr)
 	}
 
-	assignedOID, ok := extractObjectID(idField)
+	retainedOID, retainedOk := extractObjectID(idField)
 	rawVal, lookupErr := bson.Raw(docBytes).LookupErr(bsonIDField)
-	if !ok || lookupErr != nil || rawVal.Type != bson.TypeObjectID || rawVal.ObjectID() != assignedOID {
-		undoAllocations(allocated)
+	if !ok || !retainedOk || retainedOID != generatedOID || lookupErr != nil || rawVal.Type != bson.TypeObjectID || rawVal.ObjectID() != generatedOID {
+		rollbackMutations([]entityMutation{mutation})
 		return nil, NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in Save")
 	}
 
-	if _, driverErr := coll.InsertOne(ctx, bson.Raw(docBytes)); driverErr != nil {
+	if _, driverErr := coll.InsertOne(ctx, rawDocument(docBytes)); driverErr != nil {
 		return nil, NewWrappedError("MongoError", driverErr)
 	}
 	return object, nil
@@ -316,16 +333,16 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 	}
 
 	useJSON := collectionUseJSONStructTags(coll)
-	var allAllocated []reflect.Value
+	var mutations []entityMutation
 	models := make([]mongo.WriteModel, 0, len(objects))
 	for _, object := range objects {
 		if object == nil {
-			undoAllocations(allAllocated)
+			rollbackMutations(mutations)
 			return nil, NewError("IllegalArgumentError", "Cannot save nil entity in SaveAll")
 		}
 		st, encodeErr := entityIDStatus(coll, object)
 		if encodeErr != nil {
-			undoAllocations(allAllocated)
+			rollbackMutations(mutations)
 			return nil, encodeErr
 		}
 		if st.hasEncoded {
@@ -335,27 +352,41 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 				SetUpsert(true))
 		} else {
 			idField := st.field
+			var allocated []reflect.Value
 			if !idField.IsValid() {
-				var allocated []reflect.Value
 				idField, allocated = initIDField(reflect.ValueOf(object), useJSON)
-				allAllocated = append(allAllocated, allocated...)
+			}
+			var origID reflect.Value
+			if idField.IsValid() {
+				if idField.Kind() == reflect.Pointer && idField.IsNil() {
+					origID = reflect.Zero(idField.Type())
+				} else {
+					origID = reflect.ValueOf(idField.Interface())
+				}
 			}
 			if !assignGeneratedID(idField) {
-				undoAllocations(allAllocated)
+				undoAllocations(allocated)
+				rollbackMutations(mutations)
 				return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in SaveAll")
 			}
-			assignedOID, ok := extractObjectID(idField)
+			mutations = append(mutations, entityMutation{
+				allocated: allocated,
+				idField:   idField,
+				origID:    origID,
+			})
+			generatedOID, ok := extractObjectID(idField)
 			docBytes, encErr := marshalWithCollection(coll, object)
 			if encErr != nil {
-				undoAllocations(allAllocated)
+				rollbackMutations(mutations)
 				return nil, NewWrappedError("MongoError", encErr)
 			}
+			retainedOID, retainedOk := extractObjectID(idField)
 			rawVal, lookupErr := bson.Raw(docBytes).LookupErr(bsonIDField)
-			if !ok || lookupErr != nil || rawVal.Type != bson.TypeObjectID || rawVal.ObjectID() != assignedOID {
-				undoAllocations(allAllocated)
+			if !ok || !retainedOk || retainedOID != generatedOID || lookupErr != nil || rawVal.Type != bson.TypeObjectID || rawVal.ObjectID() != generatedOID {
+				rollbackMutations(mutations)
 				return nil, NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in SaveAll")
 			}
-			models = append(models, mongo.NewInsertOneModel().SetDocument(bson.Raw(docBytes)))
+			models = append(models, mongo.NewInsertOneModel().SetDocument(rawDocument(docBytes)))
 		}
 	}
 
@@ -522,6 +553,28 @@ func supportsGeneratedID(t reflect.Type) bool {
 		return false
 	}
 	return objectIDType.AssignableTo(t) || reflect.PointerTo(objectIDType).AssignableTo(t)
+}
+
+type rawDocument []byte
+
+// MarshalBSON returns the underlying pre-encoded BSON bytes without transformation.
+func (r rawDocument) MarshalBSON() ([]byte, error) {
+	return r, nil
+}
+
+type entityMutation struct {
+	idField   reflect.Value
+	origID    reflect.Value
+	allocated []reflect.Value
+}
+
+func rollbackMutations(mutations []entityMutation) {
+	for _, m := range slices.Backward(mutations) {
+		if m.idField.IsValid() && m.idField.CanSet() && m.origID.IsValid() {
+			m.idField.Set(m.origID)
+		}
+		undoAllocations(m.allocated)
+	}
 }
 
 func undoAllocations(allocated []reflect.Value) {
