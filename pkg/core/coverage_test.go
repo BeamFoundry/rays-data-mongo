@@ -325,6 +325,41 @@ type RetryAllocBaseRepo struct {
 	MongoRepository[RetryAllocBaseEntity, int]
 }
 
+type AnyNilIDEntity struct {
+	ID   any    `bson:"_id,omitempty"`
+	Name string `bson:"name"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (a *AnyNilIDEntity) MarshalBSON() ([]byte, error) {
+	if a.ID == nil {
+		return bson.Marshal(bson.M{"name": a.Name})
+	}
+	return bson.Marshal(bson.M{"_id": primitive.NewObjectID(), "name": a.Name})
+}
+
+type AnyNilIDRepo struct {
+	MongoRepository[AnyNilIDEntity, any]
+}
+
+type MutatingPtrIDEntity struct {
+	ID   *primitive.ObjectID `bson:"_id,omitempty"`
+	Name string              `bson:"name"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (m *MutatingPtrIDEntity) MarshalBSON() ([]byte, error) {
+	if m.ID != nil && m.ID.IsZero() {
+		*m.ID = primitive.NewObjectID()
+		return bson.Marshal(bson.M{"name": m.Name})
+	}
+	return bson.Marshal(bson.M{"_id": primitive.NewObjectID(), "name": m.Name})
+}
+
+type MutatingPtrIDRepo struct {
+	MongoRepository[MutatingPtrIDEntity, *primitive.ObjectID]
+}
+
 type ExplicitZeroBase struct {
 	ID int `bson:"_id"`
 }
@@ -864,6 +899,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			replacedInlineBaseRepo  *ReplacedInlineBaseRepo
 			lateMutationRepo        *LateMutationRepo
 			retryAllocBaseRepo      *RetryAllocBaseRepo
+			anyNilRepo              *AnyNilIDRepo
+			mutPtrRepo              *MutatingPtrIDRepo
 			txMgr                   MongoTransactional
 			db                      *mongo.Database
 			client                  *mongo.Client
@@ -906,6 +943,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			replacedInlineBaseRepo = &ReplacedInlineBaseRepo{}
 			lateMutationRepo = &LateMutationRepo{}
 			retryAllocBaseRepo = &RetryAllocBaseRepo{}
+			anyNilRepo = &AnyNilIDRepo{}
+			mutPtrRepo = &MutatingPtrIDRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
@@ -947,6 +986,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(replacedInlineBaseRepo)
 			AddBeamFor(lateMutationRepo)
 			AddBeamFor(retryAllocBaseRepo)
+			AddBeamFor(anyNilRepo)
+			AddBeamFor(mutPtrRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -2374,6 +2415,42 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(hasZeroIDBulk).To(BeFalse())
 			Expect(retryAllocBaseRepo.FindById(0).IsPresent()).To(BeFalse())
 
+			// Nil interface ID snapshot preserves nil interface on pre-write rejection
+			anyNilEnt := &AnyNilIDEntity{ID: nil, Name: "any-nil"}
+			_, anyNilErr := anyNilRepo.Save(anyNilEnt)
+			Expect(anyNilErr).To(HaveOccurred())
+			Expect(anyNilErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(anyNilEnt.ID).To(BeNil())
+
+			// SaveAll with nil interface ID rolls back to nil
+			anyNilBulkEnt := &AnyNilIDEntity{ID: nil, Name: "any-nil-bulk"}
+			_, anyNilBulkErr := anyNilRepo.SaveAll([]*AnyNilIDEntity{anyNilBulkEnt})
+			Expect(anyNilBulkErr).To(HaveOccurred())
+			Expect(anyNilBulkErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(anyNilBulkEnt.ID).To(BeNil())
+
+			// Non-nil pointer to primitive.ObjectID value snapshot restores value through original pointer
+			mutOID := primitive.NilObjectID
+			mutPtr := &mutOID
+			mutEnt := &MutatingPtrIDEntity{ID: mutPtr, Name: "mut-ptr"}
+			_, mutErr := mutPtrRepo.Save(mutEnt)
+			Expect(mutErr).To(HaveOccurred())
+			Expect(mutErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(mutEnt.ID).To(Equal(mutPtr))
+			Expect(*mutEnt.ID).To(Equal(primitive.NilObjectID))
+			Expect(mutOID).To(Equal(primitive.NilObjectID))
+
+			// SaveAll restores non-nil pointer value through original pointer
+			mutBulkOID := primitive.NilObjectID
+			mutBulkPtr := &mutBulkOID
+			mutBulkEnt := &MutatingPtrIDEntity{ID: mutBulkPtr, Name: "mut-ptr-bulk"}
+			_, mutBulkErr := mutPtrRepo.SaveAll([]*MutatingPtrIDEntity{mutBulkEnt})
+			Expect(mutBulkErr).To(HaveOccurred())
+			Expect(mutBulkErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(mutBulkEnt.ID).To(Equal(mutBulkPtr))
+			Expect(*mutBulkEnt.ID).To(Equal(primitive.NilObjectID))
+			Expect(mutBulkOID).To(Equal(primitive.NilObjectID))
+
 			// Explicit zero ID is upserted as-is
 			explicitZero := &ExplicitZeroEntity{Base: &ExplicitZeroBase{ID: 0}, Name: "zero-val"}
 			savedZero, err := explicitZeroRepo.Save(explicitZero)
@@ -2555,6 +2632,33 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 
 			Expect(ExportTerminalIDType(reflect.TypeFor[InlinePtrEntity](), []int{0, 0})).To(Equal(reflect.TypeFor[primitive.ObjectID]()))
 			Expect(ExportTerminalIDType(reflect.TypeFor[string](), nil)).To(BeNil())
+
+			// ExportCaptureIDSnapshot coverage
+			sID, sVal := ExportCaptureIDSnapshot(reflect.Value{})
+			Expect(sID.IsValid()).To(BeFalse())
+			Expect(sVal.IsValid()).To(BeFalse())
+
+			nilIntfField := reflect.ValueOf(&struct{ ID any }{}).Elem().Field(0)
+			sID, sVal = ExportCaptureIDSnapshot(nilIntfField)
+			Expect(sID.IsValid()).To(BeTrue())
+			Expect(sID.IsNil()).To(BeTrue())
+			Expect(sVal.IsValid()).To(BeFalse())
+
+			nilPtrField := reflect.ValueOf(&struct{ ID *int }{}).Elem().Field(0)
+			sID, sVal = ExportCaptureIDSnapshot(nilPtrField)
+			Expect(sID.IsValid()).To(BeTrue())
+			Expect(sID.IsNil()).To(BeTrue())
+			Expect(sVal.IsValid()).To(BeFalse())
+
+			nonNilPtrField := reflect.ValueOf(&struct{ ID *int }{ID: new(int)}).Elem().Field(0)
+			sID, sVal = ExportCaptureIDSnapshot(nonNilPtrField)
+			Expect(sID.IsValid()).To(BeTrue())
+			Expect(sVal.IsValid()).To(BeTrue())
+
+			valField := reflect.ValueOf(&struct{ ID int }{ID: 42}).Elem().Field(0)
+			sID, sVal = ExportCaptureIDSnapshot(valField)
+			Expect(sID.IsValid()).To(BeTrue())
+			Expect(sVal.IsValid()).To(BeFalse())
 
 			// Non-struct type for ExportFindIDPath returns nil
 			Expect(ExportFindIDPath(reflect.TypeFor[string](), false)).To(BeNil())

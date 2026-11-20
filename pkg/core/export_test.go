@@ -122,3 +122,8 @@ type ExportPointerSnapshot = pointerSnapshot
 func ExportCaptureInlinePointers(v reflect.Value, path []int) []ExportPointerSnapshot {
 	return captureInlinePointers(v, path)
 }
+
+// ExportCaptureIDSnapshot exposes captureIDSnapshot for testing.
+func ExportCaptureIDSnapshot(origIDField reflect.Value) (origID, origVal reflect.Value) {
+	return captureIDSnapshot(origIDField)
+}
