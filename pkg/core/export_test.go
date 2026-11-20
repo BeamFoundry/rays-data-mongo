@@ -114,3 +114,11 @@ func ExportRollbackMutations(mutations []ExportEntityMutation) {
 
 // ExportRawDocument exposes rawDocument for testing.
 type ExportRawDocument = rawDocument
+
+// ExportPointerSnapshot exposes pointerSnapshot for testing.
+type ExportPointerSnapshot = pointerSnapshot
+
+// ExportCaptureInlinePointers exposes captureInlinePointers for testing.
+func ExportCaptureInlinePointers(v reflect.Value, path []int) []ExportPointerSnapshot {
+	return captureInlinePointers(v, path)
+}

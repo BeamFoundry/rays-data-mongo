@@ -408,6 +408,46 @@ type ConditionalMismatchRepo struct {
 	MongoRepository[ConditionalMismatchEntity, primitive.ObjectID]
 }
 
+type ReplacedInlineBaseEntity struct {
+	Base *InlineBaseID `bson:",inline"`
+	Name string        `bson:"name"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (r *ReplacedInlineBaseEntity) MarshalBSON() ([]byte, error) {
+	if r.Base == nil || r.Base.ID.IsZero() {
+		return bson.Marshal(bson.M{"name": r.Name})
+	}
+	origID := r.Base.ID
+	r.Base = &InlineBaseID{ID: primitive.NewObjectID()}
+	return bson.Marshal(bson.M{"_id": origID, "name": r.Name})
+}
+
+type ReplacedInlineBaseRepo struct {
+	MongoRepository[ReplacedInlineBaseEntity, primitive.ObjectID]
+}
+
+type LateMutationEntity struct {
+	Target *LateMutationEntity `bson:"-"`
+	Name   string              `bson:"name"`
+	ID     primitive.ObjectID  `bson:"_id,omitempty"`
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (l *LateMutationEntity) MarshalBSON() ([]byte, error) {
+	if l.Target != nil {
+		l.Target.ID = primitive.NewObjectID()
+	}
+	if l.ID.IsZero() {
+		return bson.Marshal(bson.M{"name": l.Name})
+	}
+	return bson.Marshal(bson.M{"_id": l.ID, "name": l.Name})
+}
+
+type LateMutationRepo struct {
+	MongoRepository[LateMutationEntity, primitive.ObjectID]
+}
+
 type DescEntity struct {
 	Name        string             `bson:"name"`
 	Description string             `bson:"description"`
@@ -791,6 +831,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			mutatingRetainedRepo    *MutatingRetainedIDRepo
 			preservedMarshalerRepo  *PreservedMarshalerRepo
 			conditionalMismatchRepo *ConditionalMismatchRepo
+			replacedInlineBaseRepo  *ReplacedInlineBaseRepo
+			lateMutationRepo        *LateMutationRepo
 			txMgr                   MongoTransactional
 			db                      *mongo.Database
 			client                  *mongo.Client
@@ -830,6 +872,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			mutatingRetainedRepo = &MutatingRetainedIDRepo{}
 			preservedMarshalerRepo = &PreservedMarshalerRepo{}
 			conditionalMismatchRepo = &ConditionalMismatchRepo{}
+			replacedInlineBaseRepo = &ReplacedInlineBaseRepo{}
+			lateMutationRepo = &LateMutationRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
@@ -868,6 +912,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(mutatingRetainedRepo)
 			AddBeamFor(preservedMarshalerRepo)
 			AddBeamFor(conditionalMismatchRepo)
+			AddBeamFor(replacedInlineBaseRepo)
+			AddBeamFor(lateMutationRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -2352,6 +2398,37 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(condSlice[0].ID.IsZero()).To(BeTrue())
 			Expect(condSlice[1].ID.IsZero()).To(BeTrue())
 
+			// Replaced inline Base during marshaling is rejected and original inline state restored
+			replacedNilBase := &ReplacedInlineBaseEntity{Name: "replaced-nil-base"}
+			_, replacedSaveErr := replacedInlineBaseRepo.Save(replacedNilBase)
+			Expect(replacedSaveErr).To(HaveOccurred())
+			Expect(replacedSaveErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(replacedNilBase.Base).To(BeNil())
+
+			origBase := &InlineBaseID{ID: primitive.NilObjectID}
+			replacedNonNilBase := &ReplacedInlineBaseEntity{Base: origBase, Name: "replaced-non-nil"}
+			_, replacedNonNilErr := replacedInlineBaseRepo.Save(replacedNonNilBase)
+			Expect(replacedNonNilErr).To(HaveOccurred())
+			Expect(replacedNonNilErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(replacedNonNilBase.Base).To(Equal(origBase))
+			Expect(replacedNonNilBase.Base.ID.IsZero()).To(BeTrue())
+
+			// SaveAll rejects replaced inline Base and restores original state
+			replacedBulkEnt := &ReplacedInlineBaseEntity{Name: "replaced-bulk"}
+			_, replacedBulkErr := replacedInlineBaseRepo.SaveAll([]*ReplacedInlineBaseEntity{replacedBulkEnt})
+			Expect(replacedBulkErr).To(HaveOccurred())
+			Expect(replacedBulkErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(replacedBulkEnt.Base).To(BeNil())
+
+			// SaveAll revalidates all affected entities before BulkWrite and rolls back if any retained ID changed
+			lateEnt1 := &LateMutationEntity{Name: "late-1"}
+			lateEnt2 := &LateMutationEntity{Name: "late-2", Target: lateEnt1}
+			_, lateBulkErr := lateMutationRepo.SaveAll([]*LateMutationEntity{lateEnt1, lateEnt2})
+			Expect(lateBulkErr).To(HaveOccurred())
+			Expect(lateBulkErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(lateEnt1.ID.IsZero()).To(BeTrue())
+			Expect(lateEnt2.ID.IsZero()).To(BeTrue())
+
 			// Conflicting inline pointer entity: shallower ID wins without initializing nil Base pointer
 			confPtrEntity := &ConflictingInlinePtrEntity{Base: nil}
 			confPtrIDField := ExportFindIDField(reflect.ValueOf(confPtrEntity), false, true)
@@ -2387,13 +2464,28 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(extrOid).To(Equal(oidVal))
 
 			ExportUndoAllocations([]reflect.Value{{}})
+			settableID := reflect.ValueOf(new(primitive.ObjectID)).Elem()
 			ExportRollbackMutations([]ExportEntityMutation{
 				ExportNewEntityMutation(nil, reflect.Value{}, reflect.Value{}),
 				ExportNewEntityMutation(nil, reflect.ValueOf("immutable"), reflect.Value{}),
+				ExportNewEntityMutation(nil, settableID, reflect.ValueOf(primitive.NilObjectID)),
 			})
 			rawDocBytes, rawDocErr := ExportRawDocument([]byte{5, 0, 0, 0, 0}).MarshalBSON()
 			Expect(rawDocErr).NotTo(HaveOccurred())
 			Expect(rawDocBytes).To(Equal([]byte{5, 0, 0, 0, 0}))
+
+			Expect(ExportCaptureInlinePointers(reflect.ValueOf((*InlinePtrEntity)(nil)), []int{0, 0})).To(BeNil())
+			Expect(ExportCaptureInlinePointers(reflect.ValueOf("str"), []int{0})).To(BeNil())
+			Expect(ExportCaptureInlinePointers(reflect.ValueOf(InlinePtrEntity{}), []int{0})).To(BeNil())
+			type nonPtrInlineEntity struct {
+				Base InlineBaseID `bson:",inline"`
+			}
+			Expect(ExportCaptureInlinePointers(reflect.ValueOf(&nonPtrInlineEntity{}), []int{0, 0})).To(BeEmpty())
+			type nonStructParent struct {
+				IntVal int
+				SubVal int
+			}
+			Expect(ExportCaptureInlinePointers(reflect.ValueOf(&nonStructParent{}), []int{0, 1})).To(BeEmpty())
 
 			Expect(ExportTerminalIDType(reflect.TypeFor[InlinePtrEntity](), []int{0, 0})).To(Equal(reflect.TypeFor[primitive.ObjectID]()))
 			Expect(ExportTerminalIDType(reflect.TypeFor[string](), nil)).To(BeNil())
