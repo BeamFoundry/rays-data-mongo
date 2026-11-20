@@ -249,8 +249,29 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	if coll == nil {
 		return nil, NewError("MongoConfigurationError", "Database is not configured for repository")
 	}
+	useJSON := collectionUseJSONStructTags(coll)
+	path := findIDPath(reflect.TypeOf(object), useJSON)
+	ptrSnapshots := captureInlinePointers(reflect.ValueOf(object), path)
+	origIDField := findIDField(reflect.ValueOf(object), useJSON)
+	var origID reflect.Value
+	if origIDField.IsValid() {
+		if origIDField.Kind() == reflect.Pointer && origIDField.IsNil() {
+			origID = reflect.Zero(origIDField.Type())
+		} else {
+			origID = reflect.ValueOf(origIDField.Interface())
+		}
+	}
+	mutation := entityMutation{
+		root:     reflect.ValueOf(object),
+		idField:  origIDField,
+		origID:   origID,
+		pointers: ptrSnapshots,
+		useJSON:  useJSON,
+	}
+
 	st, encodeErr := entityIDStatus(coll, object)
 	if encodeErr != nil {
+		rollbackMutations([]entityMutation{mutation})
 		return nil, encodeErr
 	}
 
@@ -262,8 +283,6 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 		return object, nil
 	}
 
-	useJSON := collectionUseJSONStructTags(coll)
-	path := findIDPath(reflect.TypeOf(object), useJSON)
 	if len(path) == 0 {
 		if _, driverErr := coll.InsertOne(ctx, bson.Raw(st.docBytes)); driverErr != nil {
 			return nil, NewWrappedError("MongoError", driverErr)
@@ -271,37 +290,21 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 		return object, nil
 	}
 
-	ptrSnapshots := captureInlinePointers(reflect.ValueOf(object), path)
 	idField := st.field
 	var allocated []reflect.Value
 	if !idField.IsValid() {
 		idField, allocated = initIDField(reflect.ValueOf(object), useJSON)
 	}
-
-	var origID reflect.Value
-	if idField.IsValid() {
-		if idField.Kind() == reflect.Pointer && idField.IsNil() {
-			origID = reflect.Zero(idField.Type())
-		} else {
-			origID = reflect.ValueOf(idField.Interface())
-		}
-	}
+	mutation.allocated = allocated
+	mutation.idField = idField
 
 	if !assignGeneratedID(idField) {
-		undoAllocations(allocated)
+		rollbackMutations([]entityMutation{mutation})
 		return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in Save")
 	}
 
 	generatedOID, ok := extractObjectID(idField)
-	mutation := entityMutation{
-		root:         reflect.ValueOf(object),
-		idField:      idField,
-		origID:       origID,
-		allocated:    allocated,
-		pointers:     ptrSnapshots,
-		generatedOID: generatedOID,
-		useJSON:      useJSON,
-	}
+	mutation.generatedOID = generatedOID
 
 	docBytes, encErr := marshalWithCollection(coll, object)
 	if encErr != nil {
@@ -346,6 +349,28 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 			rollbackMutations(mutations)
 			return nil, NewError("IllegalArgumentError", "Cannot save nil entity in SaveAll")
 		}
+
+		path := findIDPath(reflect.TypeOf(object), useJSON)
+		ptrSnapshots := captureInlinePointers(reflect.ValueOf(object), path)
+		origIDField := findIDField(reflect.ValueOf(object), useJSON)
+		var origID reflect.Value
+		if origIDField.IsValid() {
+			if origIDField.Kind() == reflect.Pointer && origIDField.IsNil() {
+				origID = reflect.Zero(origIDField.Type())
+			} else {
+				origID = reflect.ValueOf(origIDField.Interface())
+			}
+		}
+		mutation := entityMutation{
+			root:     reflect.ValueOf(object),
+			idField:  origIDField,
+			origID:   origID,
+			pointers: ptrSnapshots,
+			useJSON:  useJSON,
+		}
+		mutations = append(mutations, mutation)
+		mutIdx := len(mutations) - 1
+
 		st, encodeErr := entityIDStatus(coll, object)
 		if encodeErr != nil {
 			rollbackMutations(mutations)
@@ -357,37 +382,20 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 				SetReplacement(bson.Raw(st.docBytes)).
 				SetUpsert(true))
 		} else {
-			path := findIDPath(reflect.TypeOf(object), useJSON)
-			ptrSnapshots := captureInlinePointers(reflect.ValueOf(object), path)
 			idField := st.field
 			var allocated []reflect.Value
 			if !idField.IsValid() {
 				idField, allocated = initIDField(reflect.ValueOf(object), useJSON)
 			}
-			var origID reflect.Value
-			if idField.IsValid() {
-				if idField.Kind() == reflect.Pointer && idField.IsNil() {
-					origID = reflect.Zero(idField.Type())
-				} else {
-					origID = reflect.ValueOf(idField.Interface())
-				}
-			}
+			mutations[mutIdx].allocated = allocated
+			mutations[mutIdx].idField = idField
+
 			if !assignGeneratedID(idField) {
-				undoAllocations(allocated)
 				rollbackMutations(mutations)
 				return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in SaveAll")
 			}
 			generatedOID, ok := extractObjectID(idField)
-			mutation := entityMutation{
-				root:         reflect.ValueOf(object),
-				idField:      idField,
-				origID:       origID,
-				allocated:    allocated,
-				pointers:     ptrSnapshots,
-				generatedOID: generatedOID,
-				useJSON:      useJSON,
-			}
-			mutations = append(mutations, mutation)
+			mutations[mutIdx].generatedOID = generatedOID
 
 			docBytes, encErr := marshalWithCollection(coll, object)
 			if encErr != nil {
@@ -407,6 +415,9 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 
 	for i := range mutations {
 		m := &mutations[i]
+		if m.generatedOID.IsZero() {
+			continue
+		}
 		retainedField := findIDField(m.root, m.useJSON)
 		retainedOID, retainedOk := extractObjectID(retainedField)
 		if !retainedOk || retainedOID != m.generatedOID {
@@ -650,15 +661,14 @@ func rollbackMutations(mutations []entityMutation) {
 			}
 		}
 		undoAllocations(m.allocated)
+		targetID := m.idField
 		if m.root.IsValid() {
-			resolvedID := findIDField(m.root, m.useJSON)
-			if resolvedID.IsValid() && resolvedID.CanSet() && m.origID.IsValid() {
-				resolvedID.Set(m.origID)
-			} else if m.idField.IsValid() && m.idField.CanSet() && m.origID.IsValid() {
-				m.idField.Set(m.origID)
+			if resolvedID := findIDField(m.root, m.useJSON); resolvedID.IsValid() {
+				targetID = resolvedID
 			}
-		} else if m.idField.IsValid() && m.idField.CanSet() && m.origID.IsValid() {
-			m.idField.Set(m.origID)
+		}
+		if targetID.IsValid() && targetID.CanSet() && m.origID.IsValid() {
+			targetID.Set(m.origID)
 		}
 	}
 }

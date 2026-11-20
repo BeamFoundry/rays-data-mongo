@@ -295,6 +295,36 @@ type InlinePtrIntRepo struct {
 	MongoRepository[InlinePtrIntEntity, int]
 }
 
+type RetryAllocBaseEntity struct {
+	Base  *InlineIntBaseID `bson:",inline"`
+	Name  string           `bson:"name"`
+	calls int
+}
+
+//nolint:wrapcheck // Test helper implementing bson.Marshaler
+func (r *RetryAllocBaseEntity) MarshalBSON() ([]byte, error) {
+	r.calls++
+	if r.calls == 1 {
+		r.Base = &InlineIntBaseID{ID: 0}
+		return bson.Marshal(struct {
+			Name string `bson:"name"`
+		}{Name: r.Name})
+	}
+	if r.Base != nil {
+		return bson.Marshal(struct {
+			Name string `bson:"name"`
+			ID   int    `bson:"_id"`
+		}{Name: r.Name, ID: r.Base.ID})
+	}
+	return bson.Marshal(struct {
+		Name string `bson:"name"`
+	}{Name: r.Name})
+}
+
+type RetryAllocBaseRepo struct {
+	MongoRepository[RetryAllocBaseEntity, int]
+}
+
 type ExplicitZeroBase struct {
 	ID int `bson:"_id"`
 }
@@ -833,6 +863,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			conditionalMismatchRepo *ConditionalMismatchRepo
 			replacedInlineBaseRepo  *ReplacedInlineBaseRepo
 			lateMutationRepo        *LateMutationRepo
+			retryAllocBaseRepo      *RetryAllocBaseRepo
 			txMgr                   MongoTransactional
 			db                      *mongo.Database
 			client                  *mongo.Client
@@ -874,6 +905,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			conditionalMismatchRepo = &ConditionalMismatchRepo{}
 			replacedInlineBaseRepo = &ReplacedInlineBaseRepo{}
 			lateMutationRepo = &LateMutationRepo{}
+			retryAllocBaseRepo = &RetryAllocBaseRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
@@ -914,6 +946,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(conditionalMismatchRepo)
 			AddBeamFor(replacedInlineBaseRepo)
 			AddBeamFor(lateMutationRepo)
+			AddBeamFor(retryAllocBaseRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -2307,6 +2340,39 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			_, retryErr := inlinePtrIntRepo.Save(ptrIntEnt)
 			Expect(retryErr).To(HaveOccurred())
 			Expect(ptrIntEnt.Base).To(BeNil())
+
+			// Retry regression: first encoding initializes inline Base and later encoding emits ID
+			retryAllocEnt := &RetryAllocBaseEntity{Name: "retry-alloc"}
+			_, retryAllocErr := retryAllocBaseRepo.Save(retryAllocEnt)
+			Expect(retryAllocErr).To(HaveOccurred())
+			Expect(retryAllocErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(retryAllocEnt.Base).To(BeNil())
+
+			// Retry rejected save leaves object unchanged so it does not encode unintended _id: 0
+			_, retryAllocErr2 := retryAllocBaseRepo.Save(retryAllocEnt)
+			Expect(retryAllocErr2).To(HaveOccurred())
+			Expect(retryAllocErr2.Name()).To(Equal("IllegalArgumentError"))
+			Expect(retryAllocEnt.Base).To(BeNil())
+			hasZeroID, err := retryAllocBaseRepo.ExistsById(0)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hasZeroID).To(BeFalse())
+			Expect(retryAllocBaseRepo.FindById(0).IsPresent()).To(BeFalse())
+
+			// SaveAll retry regression: first encoding initializes inline Base
+			retryBulkAllocEnt := &RetryAllocBaseEntity{Name: "retry-bulk-alloc"}
+			_, retryBulkAllocErr := retryAllocBaseRepo.SaveAll([]*RetryAllocBaseEntity{retryBulkAllocEnt})
+			Expect(retryBulkAllocErr).To(HaveOccurred())
+			Expect(retryBulkAllocErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(retryBulkAllocEnt.Base).To(BeNil())
+
+			_, retryBulkAllocErr2 := retryAllocBaseRepo.SaveAll([]*RetryAllocBaseEntity{retryBulkAllocEnt})
+			Expect(retryBulkAllocErr2).To(HaveOccurred())
+			Expect(retryBulkAllocErr2.Name()).To(Equal("IllegalArgumentError"))
+			Expect(retryBulkAllocEnt.Base).To(BeNil())
+			hasZeroIDBulk, err := retryAllocBaseRepo.ExistsById(0)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hasZeroIDBulk).To(BeFalse())
+			Expect(retryAllocBaseRepo.FindById(0).IsPresent()).To(BeFalse())
 
 			// Explicit zero ID is upserted as-is
 			explicitZero := &ExplicitZeroEntity{Base: &ExplicitZeroBase{ID: 0}, Name: "zero-val"}
