@@ -814,7 +814,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 		GetContainer().Reset()
 	})
 
-	It("covers MongoTransactionalManager Start(nil), nil logger, and StartSession error on unconnected client", func() {
+	It("covers MongoTransactionalManager Start(), nil logger, and StartSession error on unconnected client", func() {
 		ctx := context.Background()
 		AddBeamFor(&TestMongoConfig{})
 		AddBeamFor(&TestMongoEndpoint{Host: mongoHost, Port: mongoPort})
@@ -822,16 +822,16 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 		Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
 		txMgr := GetBeamScopedInstance[MongoTransactional]()
-		//nolint:staticcheck // Intentionally testing nil context fallback
-		sess := txMgr.Start(nil)
+		Expect(txMgr.Start()).NotTo(HaveOccurred())
+		sess := txMgr.Get()
 		Expect(sess.Error()).NotTo(HaveOccurred())
 		txMgr.End()
 
 		// Manager with nil logger
 		client := GetBeamScopedInstance[*mongo.Client]()
 		noLogMgr := NewMongoTransactionalManager(client, nil)
-		//nolint:staticcheck // Intentionally testing nil context fallback
-		s := noLogMgr.Start(nil)
+		Expect(noLogMgr.Start()).NotTo(HaveOccurred())
+		s := noLogMgr.Get()
 		Expect(s.Error()).NotTo(HaveOccurred())
 		noLogMgr.End()
 
@@ -848,17 +848,21 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 		Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
 		txMgr2 := GetBeamScopedInstance[MongoTransactional]()
-		sess2 := txMgr2.Start(ctx)
+		Expect(txMgr2.Start()).To(HaveOccurred())
+		sess2 := txMgr2.Get()
 		Expect(sess2.Error()).To(HaveOccurred())
 		Expect(sess2.Validate()).To(HaveOccurred())
 		Expect(sess2.Rollback()).To(HaveOccurred())
 		Expect(sess2.Commit()).To(HaveOccurred())
+		txMgr2.End()
 
-		// Transactional closure logs ms.Error() and exits safely when Start fails
-		txMgr2.Transactional(ctx, func(_ *MongoSession) Error {
-			Fail("should not run action when Start fails")
+		// Coordinated TransactionManager fails when provider Start fails on lazy enlistment
+		globalTxMgr := GetBeamScopedInstance[TransactionManager]()
+		Expect(globalTxMgr.Transactional(func() Error {
+			enlistedSess := txMgr2.Get()
+			Expect(enlistedSess.Error()).To(HaveOccurred())
 			return nil
-		})
+		})).To(HaveOccurred())
 	})
 
 	Context("Core Query, Repository, Builder, and Session Edge Cases", func() {
@@ -1043,7 +1047,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(deadSess.Value(ctxKey("k"))).To(Equal("v"))
 
 			// Manual Commit & double-finalization validation
-			s1 := txMgr.Start(context.Background())
+			Expect(txMgr.Start()).NotTo(HaveOccurred())
+			s1 := txMgr.Get()
 			Expect(s1.Session()).NotTo(BeNil())
 			Expect(s1.Commit()).NotTo(HaveOccurred())
 			Expect(s1.Validate()).To(HaveOccurred())
@@ -1055,28 +1060,34 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(txMgr.Get()).NotTo(BeNil())
 
 			// Manual Abort alias
-			s2 := txMgr.Start(context.Background())
+			Expect(txMgr.Start()).NotTo(HaveOccurred())
+			s2 := txMgr.Get()
 			Expect(s2.Abort()).NotTo(HaveOccurred())
 			txMgr.End()
 
 			// Direct underlying AbortTransaction causes MongoSession.Rollback() driver error
-			s3 := txMgr.Start(context.Background())
+			Expect(txMgr.Start()).NotTo(HaveOccurred())
+			s3 := txMgr.Get()
 			Expect(s3.Session().AbortTransaction(context.Background())).NotTo(HaveOccurred())
 			Expect(s3.Rollback()).To(HaveOccurred())
 			txMgr.End()
 
 			// CommitTransaction driver error via direct underlying AbortTransaction inside Transactional
-			txMgr.Transactional(context.Background(), func(ms *MongoSession) Error {
+			globalTxMgr := GetBeamScopedInstance[TransactionManager]()
+			Expect(globalTxMgr.Transactional(func() Error {
+				ms := txMgr.Get()
 				Expect(ms.Session().AbortTransaction(context.Background())).NotTo(HaveOccurred())
 				return nil
-			})
+			})).To(HaveOccurred())
 		})
 
 		It("covers Transactional Rollback failure when underlying session was already aborted", func() {
-			txMgr.Transactional(context.Background(), func(ms *MongoSession) Error {
+			globalTxMgr := GetBeamScopedInstance[TransactionManager]()
+			Expect(globalTxMgr.Transactional(func() Error {
+				ms := txMgr.Get()
 				Expect(ms.Session().AbortTransaction(context.Background())).NotTo(HaveOccurred())
 				return NewError("ForceRollback", "rollback after direct abort")
-			})
+			})).To(HaveOccurred())
 		})
 
 		It("covers MongoQuery builder methods, error paths, Distinct, Aggregate, and likeToRegex", func() {
@@ -1341,7 +1352,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 
 			// Delete returning Error only (success + failure after rollback)
 			Expect(richRepo.deleteOnlyErrByLabel("Beta")).NotTo(HaveOccurred())
-			sess := txMgr.Start(context.Background())
+			Expect(txMgr.Start()).NotTo(HaveOccurred())
+			sess := txMgr.Get()
 			Expect(sess.Rollback()).NotTo(HaveOccurred())
 			Expect(richRepo.deleteOnlyErrByLabel("Alpha_100%")).To(HaveOccurred())
 			txMgr.End()
@@ -1472,7 +1484,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(saveErr).NotTo(HaveOccurred())
 
 			// Aborted session errors for all repository and query methods
-			sess := txMgr.Start(context.Background())
+			Expect(txMgr.Start()).NotTo(HaveOccurred())
+			sess := txMgr.Get()
 			qPreFinalize := userRepo.Query().Where(bson.M{"name": "seeded_for_qpre"})
 
 			// Query created before rollback must succeed dynamically when executed within active transaction
@@ -1793,49 +1806,42 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			strVal := "hello"
 			Expect(ExportAssignGeneratedID(reflect.ValueOf(&strVal).Elem())).To(BeFalse())
 
-			// 7. Execute and ExecuteWithResult APIs
+			// 7. TransactionManager coordination with MongoTransactionalManager
+			globalTxMgr := GetBeamScopedInstance[TransactionManager]()
 			mgr := txMgr.(*MongoTransactionalManager)
-			exRes, exErr := ExecuteWithResult(context.Background(), mgr, func(_ *MongoSession) (string, Error) {
-				return "success", nil
-			})
-			Expect(exErr).NotTo(HaveOccurred())
-			Expect(exRes).To(Equal("success"))
-
-			_, exErr = ExecuteWithResult(context.Background(), mgr, func(_ *MongoSession) (string, Error) {
-				return "", NewError("ActionError", "action failed")
-			})
-			Expect(exErr).To(HaveOccurred())
-
-			_, exErr = ExecuteWithResult[string](context.Background(), nil, nil)
-			Expect(exErr).To(HaveOccurred())
-
-			exErr = mgr.Execute(context.Background(), func(_ *MongoSession) Error {
+			exErr := globalTxMgr.Transactional(func() Error {
 				return nil
 			})
 			Expect(exErr).NotTo(HaveOccurred())
 
-			exErr = mgr.Execute(context.Background(), func(_ *MongoSession) Error {
-				return NewError("ActionError", "failed")
+			exErr = globalTxMgr.Transactional(func() Error {
+				return NewError("ActionError", "action failed")
 			})
 			Expect(exErr).To(HaveOccurred())
 
-			// Execute with panic recovery
-			panicErr := mgr.Execute(context.Background(), func(_ *MongoSession) Error {
+			// FindById non-ErrNoDocuments decode error reports to SetError
+			badDocID := primitive.NewObjectID()
+			_, rawInsErr := userRepo.Collection().InsertOne(context.Background(), bson.M{"_id": badDocID, "age": "invalid_uint"})
+			Expect(rawInsErr).NotTo(HaveOccurred())
+			decodeTxErr := globalTxMgr.Transactional(func() Error {
+				Expect(userRepo.FindById(badDocID).IsPresent()).To(BeFalse())
+				return nil
+			})
+			Expect(decodeTxErr).To(HaveOccurred())
+			Expect(userRepo.DeleteById(badDocID)).NotTo(HaveOccurred())
+
+			// Transactional with panic recovery
+			panicErr := globalTxMgr.Transactional(func() Error {
 				panic("callback panic")
 			})
 			Expect(panicErr).To(HaveOccurred())
 
-			// ExecuteWithResult with panic recovery
-			_, panicResErr := ExecuteWithResult(context.Background(), mgr, func(_ *MongoSession) (int, Error) {
-				panic("callback panic")
-			})
-			Expect(panicResErr).To(HaveOccurred())
-
 			// 8. Nested transaction management (Start/End stack restoration)
-			sOuter := mgr.Start(context.Background())
-			Expect(mgr.Get()).To(Equal(sOuter))
-			sInner := mgr.Start(context.Background())
-			Expect(mgr.Get()).To(Equal(sInner))
+			Expect(mgr.Start()).NotTo(HaveOccurred())
+			sOuter := mgr.Get()
+			Expect(mgr.Start()).NotTo(HaveOccurred())
+			sInner := mgr.Get()
+			Expect(sInner).NotTo(Equal(sOuter))
 			mgr.End()
 			Expect(mgr.Get()).To(Equal(sOuter))
 			mgr.End()
@@ -1860,11 +1866,13 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			Expect(mErr).NotTo(HaveOccurred())
 			defer func() { _ = monitoredClient.Disconnect(context.Background()) }()
 
-			monitoredMgr := NewMongoTransactionalManager(monitoredClient, nil)
+			monitoredMgr := NewMongoTransactionalManager(monitoredClient, nil).WithTransactionManager(globalTxMgr)
 			monitoredColl := monitoredClient.Database("test_db").Collection("users")
 
 			cancelCtx, cancelFn := context.WithCancel(context.Background())
-			sCancel := monitoredMgr.Start(cancelCtx)
+			globalTxMgr.SetContext(cancelCtx)
+			Expect(monitoredMgr.Start()).NotTo(HaveOccurred())
+			sCancel := monitoredMgr.Get()
 
 			cancelDocID := primitive.NewObjectID()
 			_, insErr := monitoredColl.InsertOne(sCancel.Context(), bson.M{"_id": cancelDocID, "name": "cancel_user"})
@@ -1873,6 +1881,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			cancelFn()
 			Expect(sCancel.Rollback()).NotTo(HaveOccurred())
 			monitoredMgr.End()
+			globalTxMgr.ClearContext()
 
 			abortMu.Lock()
 			Expect(abortSent).To(BeTrue())

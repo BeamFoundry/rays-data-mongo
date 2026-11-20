@@ -3,10 +3,12 @@ package core
 import (
 	"bytes"
 	"context"
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
 
+	"github.com/timandy/routine"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsoncodec"
 	"go.mongodb.org/mongo-driver/bson/bsonrw"
@@ -26,6 +28,43 @@ const bsonIDField = "_id"
 // to explicitly specify its MongoDB collection name instead of using the derived default.
 type CollectionNamer interface {
 	CollectionName() string
+}
+
+// MongoTransactionalResolver can be implemented by a repository struct embedding [MongoRepository]
+// to return a [MongoTransactional] for a given [context.Context] (for example, using an injected
+// [Foundry] of [MongoTransactional]).
+type MongoTransactionalResolver interface {
+	MongoTransactional(ctx context.Context) MongoTransactional
+}
+
+// MongoEntityTypeProvider is implemented by [MongoRepository] (and promoted to any embedding repository)
+// to expose the managed entity's [reflect.Type].
+type MongoEntityTypeProvider interface {
+	EntityType() reflect.Type
+}
+
+// MongoRepositoryTypeFromContext extracts the embedding repository's [reflect.Type] (e.g. *UserRepository)
+// from a Prototype [context.Context] (checking [PrototypeContextProxyType] first, then [PrototypeContextParentType]).
+func MongoRepositoryTypeFromContext(ctx context.Context) reflect.Type {
+	if t, ok := ctx.Value(PrototypeContextProxyType).(reflect.Type); ok {
+		return t
+	}
+	if t, ok := ctx.Value(PrototypeContextParentType).(reflect.Type); ok {
+		return t
+	}
+	return nil
+}
+
+// MongoEntityTypeFromContext extracts the entity's [reflect.Type] (e.g. User) from a Prototype [context.Context]
+// (checking [PrototypeContextProxyInstance] first, then [PrototypeContextParentInstance]).
+func MongoEntityTypeFromContext(ctx context.Context) reflect.Type {
+	if p, ok := ctx.Value(PrototypeContextProxyInstance).(MongoEntityTypeProvider); ok {
+		return p.EntityType()
+	}
+	if p, ok := ctx.Value(PrototypeContextParentInstance).(MongoEntityTypeProvider); ok {
+		return p.EntityType()
+	}
+	return nil
 }
 
 // MongoRepositoryInterface defines the standard CRUD and query contract for a MongoDB repository
@@ -55,22 +94,74 @@ type MongoRepositoryInterface[T any, K comparable] interface {
 	EnsureIndexes(ctx context.Context, models ...mongo.IndexModel) ([]string, Error)
 }
 
+type txContextEntry struct {
+	//nolint:containedctx // Caches resolved MongoTransactional for the active goroutine context
+	ctx context.Context
+	tx  MongoTransactional
+}
+
 // MongoRepository is the base embeddable repository for MongoDB entities.
 // Embed this struct inside a domain repository alongside unexported query function fields
 // (e.g. findByName func(string) *User) to have Rays automatically wire them during container initialization.
 type MongoRepository[T any, K comparable] struct {
 	Repository
-	database           *mongo.Database    `@:"Inject"`
+	txManager          TransactionManager `@:"Inject"`
 	transactionManager MongoTransactional `@:"Inject"`
 	logger             Logging            `@:"Inject"`
+	resolver           MongoTransactionalResolver
+	txCache            routine.ThreadLocal[*txContextEntry]
 	collectionName     string
 }
 
+// EntityType returns the [reflect.Type] of the entity T managed by this repository.
+func (this *MongoRepository[T, K]) EntityType() reflect.Type {
+	return reflect.TypeFor[T]()
+}
+
+func (this *MongoRepository[T, K]) tx() MongoTransactional {
+	if this.resolver == nil {
+		return this.transactionManager
+	}
+	ctx := this.txManager.GetContext()
+	comparableCtx := reflect.TypeOf(ctx).Comparable()
+	if this.txCache != nil && comparableCtx {
+		if entry := this.txCache.Get(); entry != nil && entry.tx != nil && entry.ctx == ctx {
+			return entry.tx
+		}
+	}
+	resolved := this.resolver.MongoTransactional(ctx)
+	if resolved == nil {
+		return this.transactionManager
+	}
+	if this.txCache != nil && comparableCtx {
+		this.txCache.Set(&txContextEntry{ctx: ctx, tx: resolved})
+	}
+	return resolved
+}
+
+func (this *MongoRepository[T, K]) txAndDB() (MongoTransactional, *mongo.Database) {
+	tx := this.tx()
+	if tx == nil {
+		return nil, nil
+	}
+	return tx, tx.Database()
+}
+
+func (this *MongoRepository[T, K]) recordError(err Error) Error {
+	if err != nil {
+		if tx := this.tx(); tx != nil {
+			tx.SetError(err)
+		}
+	}
+	return err
+}
+
 func (this *MongoRepository[T, K]) validateActiveSession() (context.Context, Error) {
-	if this.transactionManager == nil {
+	tx := this.tx()
+	if tx == nil {
 		return context.Background(), nil
 	}
-	ms := this.transactionManager.Get()
+	ms := tx.Get()
 	if err := ms.Validate(); err != nil {
 		return ms.Context(), err
 	}
@@ -78,8 +169,8 @@ func (this *MongoRepository[T, K]) validateActiveSession() (context.Context, Err
 }
 
 func (this *MongoRepository[T, K]) activeContext() context.Context {
-	if this.transactionManager != nil {
-		return this.transactionManager.Get()
+	if tx := this.tx(); tx != nil {
+		return tx.Get()
 	}
 	return context.Background()
 }
@@ -125,30 +216,39 @@ func pluralize(word string) string {
 
 // Collection returns the underlying [*mongo.Collection] for entity T.
 func (this *MongoRepository[T, K]) Collection() *mongo.Collection {
-	if this.database == nil {
+	_, db := this.txAndDB()
+	if db == nil {
 		return nil
 	}
-	return this.database.Collection(this.resolveCollectionName())
+	return db.Collection(this.resolveCollectionName())
 }
 
 // Query creates a new [*MongoQuery] targeting T's collection with any active ThreadLocal transaction context.
 func (this *MongoRepository[T, K]) Query(queries ...MongoQueryFunc) *MongoQuery {
-	q := NewMongoQuery(this.activeContext(), this.database, this.resolveCollectionName())
+	_, db := this.txAndDB()
+	q := NewMongoQuery(this.activeContext(), db, this.resolveCollectionName())
 	return q.Scopes(queries...)
 }
 
 // FindById finds a document by its _id field and returns an [Optional] pointer.
 func (this *MongoRepository[T, K]) FindById(id K) Optional[*T] {
-	if this.database == nil {
+	coll := this.Collection()
+	if coll == nil {
 		return OptionalEmpty[*T]()
 	}
 	ctx, err := this.validateActiveSession()
 	if err != nil {
+		//nolint:errcheck // FindById returns Optional[*T] while recording session error on transaction manager
+		_ = this.recordError(err)
 		return OptionalEmpty[*T]()
 	}
 	var t T
-	res := this.Collection().FindOne(ctx, bson.M{bsonIDField: id})
-	if err := res.Decode(&t); err != nil {
+	res := coll.FindOne(ctx, bson.M{bsonIDField: id})
+	if decodeErr := res.Decode(&t); decodeErr != nil {
+		if !errors.Is(decodeErr, mongo.ErrNoDocuments) {
+			//nolint:errcheck // FindById returns Optional[*T] while recording decode error on transaction manager
+			_ = this.recordError(NewWrappedError("MongoError", decodeErr))
+		}
 		return OptionalEmpty[*T]()
 	}
 	return OptionalOf(&t)
@@ -158,32 +258,34 @@ func (this *MongoRepository[T, K]) FindById(id K) Optional[*T] {
 func (this *MongoRepository[T, K]) FindAll() ([]T, Error) {
 	var results []T
 	if err := this.Query().Find(&results); err != nil {
-		return nil, err
+		return nil, this.recordError(err)
 	}
 	return results, nil
 }
 
 // Count returns the total number of documents in the entity collection.
 func (this *MongoRepository[T, K]) Count() (int64, Error) {
-	return this.Query().Count()
+	count, err := this.Query().Count()
+	return count, this.recordError(err)
 }
 
 // ExistsById returns true if a document with the given _id exists in the collection.
 func (this *MongoRepository[T, K]) ExistsById(id K) (bool, Error) {
-	if this.database == nil {
-		return false, NewError("MongoConfigurationError", "Database is not configured for repository")
+	coll := this.Collection()
+	if coll == nil {
+		return false, this.recordError(NewError("MongoConfigurationError", "Database is not configured for repository"))
 	}
 	ctx, err := this.validateActiveSession()
 	if err != nil {
-		return false, err
+		return false, this.recordError(err)
 	}
-	count, driverErr := this.Collection().CountDocuments(
+	count, driverErr := coll.CountDocuments(
 		ctx,
 		bson.M{bsonIDField: id},
 		options.Count().SetLimit(1),
 	)
 	if driverErr != nil {
-		return false, NewWrappedError("MongoError", driverErr)
+		return false, this.recordError(NewWrappedError("MongoError", driverErr))
 	}
 	return count > 0, nil
 }
@@ -192,25 +294,25 @@ func (this *MongoRepository[T, K]) ExistsById(id K) (bool, Error) {
 // If no _id-mapped field exists, entity-based deletion is rejected and callers must use DeleteById with the actual key.
 func (this *MongoRepository[T, K]) Delete(object *T) Error {
 	if object == nil {
-		return NewError("IllegalArgumentError", "Cannot delete nil entity")
+		return this.recordError(NewError("IllegalArgumentError", "Cannot delete nil entity"))
 	}
 	ctx, err := this.validateActiveSession()
 	if err != nil {
-		return err
+		return this.recordError(err)
 	}
 	coll := this.Collection()
 	st, encodeErr := entityIDStatus(coll, object)
 	if encodeErr != nil {
-		return encodeErr
+		return this.recordError(encodeErr)
 	}
 	if !st.hasEncoded {
-		return NewError("IllegalArgumentError", "Entity does not have a non-zero _id field; use DeleteById with the actual key")
+		return this.recordError(NewError("IllegalArgumentError", "Entity does not have a non-zero _id field; use DeleteById with the actual key"))
 	}
 	if coll == nil {
-		return NewError("MongoConfigurationError", "Database is not configured for repository")
+		return this.recordError(NewError("MongoConfigurationError", "Database is not configured for repository"))
 	}
 	if _, driverErr := coll.DeleteOne(ctx, bson.M{bsonIDField: st.val}); driverErr != nil {
-		return NewWrappedError("MongoError", driverErr)
+		return this.recordError(NewWrappedError("MongoError", driverErr))
 	}
 	return nil
 }
@@ -219,14 +321,14 @@ func (this *MongoRepository[T, K]) Delete(object *T) Error {
 func (this *MongoRepository[T, K]) DeleteById(id K) Error {
 	ctx, err := this.validateActiveSession()
 	if err != nil {
-		return err
+		return this.recordError(err)
 	}
 	coll := this.Collection()
 	if coll == nil {
-		return NewError("MongoConfigurationError", "Database is not configured for repository")
+		return this.recordError(NewError("MongoConfigurationError", "Database is not configured for repository"))
 	}
 	if _, driverErr := coll.DeleteOne(ctx, bson.M{bsonIDField: id}); driverErr != nil {
-		return NewWrappedError("MongoError", driverErr)
+		return this.recordError(NewWrappedError("MongoError", driverErr))
 	}
 	return nil
 }
@@ -238,16 +340,16 @@ func (this *MongoRepository[T, K]) DeleteById(id K) Error {
 // explicit zero values are upserted as-is.
 func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	if object == nil {
-		return nil, NewError("IllegalArgumentError", "Cannot save nil entity")
+		return nil, this.recordError(NewError("IllegalArgumentError", "Cannot save nil entity"))
 	}
 	ctx, err := this.validateActiveSession()
 	if err != nil {
-		return nil, err
+		return nil, this.recordError(err)
 	}
 
 	coll := this.Collection()
 	if coll == nil {
-		return nil, NewError("MongoConfigurationError", "Database is not configured for repository")
+		return nil, this.recordError(NewError("MongoConfigurationError", "Database is not configured for repository"))
 	}
 	useJSON := collectionUseJSONStructTags(coll)
 	path := findIDPath(reflect.TypeOf(object), useJSON)
@@ -266,20 +368,20 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	st, encodeErr := entityIDStatus(coll, object)
 	if encodeErr != nil {
 		rollbackMutations([]entityMutation{mutation})
-		return nil, encodeErr
+		return nil, this.recordError(encodeErr)
 	}
 
 	if st.hasEncoded {
 		opts := options.Replace().SetUpsert(true)
 		if _, driverErr := coll.ReplaceOne(ctx, bson.M{bsonIDField: st.val}, bson.Raw(st.docBytes), opts); driverErr != nil {
-			return nil, NewWrappedError("MongoError", driverErr)
+			return nil, this.recordError(NewWrappedError("MongoError", driverErr))
 		}
 		return object, nil
 	}
 
 	if len(path) == 0 {
 		if _, driverErr := coll.InsertOne(ctx, bson.Raw(st.docBytes)); driverErr != nil {
-			return nil, NewWrappedError("MongoError", driverErr)
+			return nil, this.recordError(NewWrappedError("MongoError", driverErr))
 		}
 		return object, nil
 	}
@@ -294,7 +396,7 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 
 	if !assignGeneratedID(idField) {
 		rollbackMutations([]entityMutation{mutation})
-		return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in Save")
+		return nil, this.recordError(NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in Save"))
 	}
 
 	generatedOID, ok := extractObjectID(idField)
@@ -303,7 +405,7 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	docBytes, encErr := marshalWithCollection(coll, object)
 	if encErr != nil {
 		rollbackMutations([]entityMutation{mutation})
-		return nil, NewWrappedError("MongoError", encErr)
+		return nil, this.recordError(NewWrappedError("MongoError", encErr))
 	}
 
 	retainedField := findIDField(reflect.ValueOf(object), useJSON)
@@ -311,11 +413,11 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 	rawVal, lookupErr := bson.Raw(docBytes).LookupErr(bsonIDField)
 	if !ok || !retainedOk || retainedOID != generatedOID || lookupErr != nil || rawVal.Type != bson.TypeObjectID || rawVal.ObjectID() != generatedOID {
 		rollbackMutations([]entityMutation{mutation})
-		return nil, NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in Save")
+		return nil, this.recordError(NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in Save"))
 	}
 
 	if _, driverErr := coll.InsertOne(ctx, rawDocument(docBytes)); driverErr != nil {
-		return nil, NewWrappedError("MongoError", driverErr)
+		return nil, this.recordError(NewWrappedError("MongoError", driverErr))
 	}
 	return object, nil
 }
@@ -327,12 +429,12 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 	}
 	ctx, err := this.validateActiveSession()
 	if err != nil {
-		return nil, err
+		return nil, this.recordError(err)
 	}
 
 	coll := this.Collection()
 	if coll == nil {
-		return nil, NewError("MongoConfigurationError", "Database is not configured for repository")
+		return nil, this.recordError(NewError("MongoConfigurationError", "Database is not configured for repository"))
 	}
 
 	useJSON := collectionUseJSONStructTags(coll)
@@ -340,7 +442,7 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 	for i, object := range objects {
 		if object == nil {
 			rollbackMutations(mutations[:i])
-			return nil, NewError("IllegalArgumentError", "Cannot save nil entity in SaveAll")
+			return nil, this.recordError(NewError("IllegalArgumentError", "Cannot save nil entity in SaveAll"))
 		}
 		path := findIDPath(reflect.TypeOf(object), useJSON)
 		ptrSnapshots := captureInlinePointers(reflect.ValueOf(object), path)
@@ -361,7 +463,7 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 		st, encodeErr := entityIDStatus(coll, object)
 		if encodeErr != nil {
 			rollbackMutations(mutations)
-			return nil, encodeErr
+			return nil, this.recordError(encodeErr)
 		}
 		if st.hasEncoded {
 			models = append(models, mongo.NewReplaceOneModel().
@@ -379,7 +481,7 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 
 			if !assignGeneratedID(idField) {
 				rollbackMutations(mutations)
-				return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in SaveAll")
+				return nil, this.recordError(NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in SaveAll"))
 			}
 			generatedOID, ok := extractObjectID(idField)
 			mutations[i].generatedOID = generatedOID
@@ -387,14 +489,14 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 			docBytes, encErr := marshalWithCollection(coll, object)
 			if encErr != nil {
 				rollbackMutations(mutations)
-				return nil, NewWrappedError("MongoError", encErr)
+				return nil, this.recordError(NewWrappedError("MongoError", encErr))
 			}
 			retainedField := findIDField(reflect.ValueOf(object), useJSON)
 			retainedOID, retainedOk := extractObjectID(retainedField)
 			rawVal, lookupErr := bson.Raw(docBytes).LookupErr(bsonIDField)
 			if !ok || !retainedOk || retainedOID != generatedOID || lookupErr != nil || rawVal.Type != bson.TypeObjectID || rawVal.ObjectID() != generatedOID {
 				rollbackMutations(mutations)
-				return nil, NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in SaveAll")
+				return nil, this.recordError(NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in SaveAll"))
 			}
 			models = append(models, mongo.NewInsertOneModel().SetDocument(rawDocument(docBytes)))
 		}
@@ -409,12 +511,12 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 		retainedOID, retainedOk := extractObjectID(retainedField)
 		if !retainedOk || retainedOID != m.generatedOID {
 			rollbackMutations(mutations)
-			return nil, NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in SaveAll")
+			return nil, this.recordError(NewError("IllegalArgumentError", "Entity does not have an _id field matching generated ID in SaveAll"))
 		}
 	}
 
 	if _, driverErr := coll.BulkWrite(ctx, models); driverErr != nil {
-		return nil, NewWrappedError("MongoError", driverErr)
+		return nil, this.recordError(NewWrappedError("MongoError", driverErr))
 	}
 	return objects, nil
 }
@@ -426,7 +528,7 @@ func (this *MongoRepository[T, K]) EnsureIndexes(ctx context.Context, models ...
 	}
 	activeCtx, sessErr := this.validateActiveSession()
 	if sessErr != nil {
-		return nil, sessErr
+		return nil, this.recordError(sessErr)
 	}
 	//nolint:contextcheck // Fallback to active repository session context when caller passes nil
 	execCtx := ctx
@@ -435,11 +537,11 @@ func (this *MongoRepository[T, K]) EnsureIndexes(ctx context.Context, models ...
 	}
 	coll := this.Collection()
 	if coll == nil {
-		return nil, NewError("MongoConfigurationError", "Database is not configured for repository")
+		return nil, this.recordError(NewError("MongoConfigurationError", "Database is not configured for repository"))
 	}
 	names, err := coll.Indexes().CreateMany(execCtx, models)
 	if err != nil {
-		return nil, NewWrappedError("MongoError", err)
+		return nil, this.recordError(NewWrappedError("MongoError", err))
 	}
 	return names, nil
 }
@@ -447,9 +549,13 @@ func (this *MongoRepository[T, K]) EnsureIndexes(ctx context.Context, models ...
 // PostConstruct implements [InnerBeamPostConstruct] to parse and wire derived query function fields
 // declared on the embedding repository struct.
 func (this *MongoRepository[T, K]) PostConstruct(parent any) Error {
+	this.txCache = routine.NewThreadLocal[*txContextEntry]()
 	this.collectionName = this.resolveCollectionName()
 	reflectType := reflect.TypeOf(parent)
 	queryBuilder := mongoQueryBuilder[T, K]{}.New(this.logger, this.Collection())
+	if resolver, ok := parent.(MongoTransactionalResolver); ok {
+		this.resolver = resolver
+	}
 	for field := range reflectType.Elem().Fields() {
 		if field.Type.Kind() != reflect.Func {
 			continue
@@ -465,7 +571,7 @@ func (this *MongoRepository[T, K]) PostConstruct(parent any) Error {
 		if !function.IsExported() {
 			f = UnprotectValue(f)
 		}
-		query := compiled.Query(this.database, this.transactionManager, this.collectionName)
+		query := compiled.Query(this.txAndDB, this.collectionName)
 		f.Set(reflect.MakeFunc(function.Type, query))
 	}
 	return nil

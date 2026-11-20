@@ -3,6 +3,7 @@ package core_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"runtime/pprof"
 	"testing"
 	"time"
@@ -263,14 +264,17 @@ func (t *TestMongoConfig) Database(
 
 type UserService struct {
 	Service
-	transactionManager MongoTransactional      `@:"Inject"`
-	userRepository     UserRepositoryInterface `@:"Inject"`
+	txManager      TransactionManager      `@:"Inject"`
+	userRepository UserRepositoryInterface `@:"Inject"`
 }
 
 func (this *UserService) TransactionalChangeRollback(userID primitive.ObjectID) {
 	var writeCompleted bool
 	var originalName string
-	this.transactionManager.Transactional(context.Background(), func(_ *MongoSession) Error {
+	this.txManager.SetContext(context.Background())
+	defer this.txManager.ClearContext()
+
+	txErr := this.txManager.Transactional(func() Error {
 		user, ok := this.userRepository.FindById(userID).Get()
 		Expect(ok).To(BeTrue())
 		originalName = user.Name
@@ -283,6 +287,7 @@ func (this *UserService) TransactionalChangeRollback(userID primitive.ObjectID) 
 		Expect(reRead.Name).To(Equal("bar"))
 		return NewError("TransactionalError", "Rolling back")
 	})
+	Expect(txErr).To(HaveOccurred())
 
 	Expect(writeCompleted).To(BeTrue())
 	u := this.userRepository.FindByName("bar")
@@ -298,8 +303,11 @@ func (this *UserService) TransactionalChangeRollbackPprof(userID primitive.Objec
 	writeCompleted := false
 	var originalName string
 
-	this.transactionManager.Transactional(ctx, func(_ *MongoSession) Error {
-		pprof.Do(ctx, labels, func(_ context.Context) {
+	pprof.Do(ctx, labels, func(pprofCtx context.Context) {
+		this.txManager.SetContext(pprofCtx)
+		defer this.txManager.ClearContext()
+
+		txErr := this.txManager.Transactional(func() Error {
 			user, ok := this.userRepository.FindById(userID).Get()
 			Expect(ok).To(BeTrue())
 			originalName = user.Name
@@ -310,8 +318,9 @@ func (this *UserService) TransactionalChangeRollbackPprof(userID primitive.Objec
 			reRead, ok := this.userRepository.FindById(userID).Get()
 			Expect(ok).To(BeTrue())
 			Expect(reRead.Name).To(Equal("bar-pprof"))
+			return NewError("TransactionalError", "Rolling back inside pprof")
 		})
-		return NewError("TransactionalError", "Rolling back inside pprof")
+		Expect(txErr).To(HaveOccurred())
 	})
 
 	Expect(writeCompleted).To(BeTrue())
@@ -322,8 +331,38 @@ func (this *UserService) TransactionalChangeRollbackPprof(userID primitive.Objec
 	Expect(original.Name).To(Equal(originalName))
 }
 
+func (this *UserService) TransactionalRepositorySetErrorRollback(userID primitive.ObjectID) {
+	this.txManager.SetContext(context.Background())
+	defer this.txManager.ClearContext()
+
+	var originalName string
+	txErr := this.txManager.Transactional(func() Error {
+		user, ok := this.userRepository.FindById(userID).Get()
+		Expect(ok).To(BeTrue())
+		originalName = user.Name
+		user.Name = "bar-seterror"
+		_, err := this.userRepository.Save(user)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Trigger a repository error via SetError and ignore it in the callback return
+		_, findErr := this.userRepository.FindWithErrorByUserName("non_existent_user")
+		Expect(findErr).To(HaveOccurred())
+		return nil
+	})
+	Expect(txErr).To(HaveOccurred())
+
+	u := this.userRepository.FindByName("bar-seterror")
+	Expect(u).To(BeNil())
+	original, ok := this.userRepository.FindById(userID).Get()
+	Expect(ok).To(BeTrue())
+	Expect(original.Name).To(Equal(originalName))
+}
+
 func (this *UserService) TransactionalChangeCommit(userID primitive.ObjectID) {
-	this.transactionManager.Transactional(context.Background(), func(_ *MongoSession) Error {
+	this.txManager.SetContext(context.Background())
+	defer this.txManager.ClearContext()
+
+	txErr := this.txManager.Transactional(func() Error {
 		user, ok := this.userRepository.FindById(userID).Get()
 		Expect(ok).To(BeTrue())
 		user.Name = "bar"
@@ -331,6 +370,7 @@ func (this *UserService) TransactionalChangeCommit(userID primitive.ObjectID) {
 		Expect(err).NotTo(HaveOccurred())
 		return nil
 	})
+	Expect(txErr).NotTo(HaveOccurred())
 
 	u := this.userRepository.FindByName("bar")
 	Expect(u).NotTo(BeNil())
@@ -338,14 +378,17 @@ func (this *UserService) TransactionalChangeCommit(userID primitive.ObjectID) {
 }
 
 func (this *UserService) ErrorAfterRollback(userID primitive.ObjectID) {
-	sess := this.transactionManager.Start(context.Background())
-	defer this.transactionManager.End()
+	this.txManager.SetContext(context.Background())
+	defer this.txManager.ClearContext()
+
+	Expect(this.txManager.Start()).NotTo(HaveOccurred())
+	defer this.txManager.End()
 
 	user, ok := this.userRepository.FindById(userID).Get()
 	Expect(ok).To(BeTrue())
-	Expect(sess.Rollback()).NotTo(HaveOccurred())
+	Expect(this.txManager.Rollback()).NotTo(HaveOccurred())
 
-	// After AbortTransaction + EndSession, operations using the aborted session fail
+	// After AbortTransaction, operations using the aborted session fail
 	Expect(this.userRepository.Delete(user)).To(HaveOccurred())
 	Expect(this.userRepository.DeleteById(userID)).To(HaveOccurred())
 	_, err := this.userRepository.Save(user)
@@ -678,8 +721,268 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 		It("supports ThreadLocal transactions with commit, rollback, and manual error after rollback", func() {
 			userService.TransactionalChangeRollback(dorothy.ID)
 			userService.TransactionalChangeRollbackPprof(dorothy.ID)
+			userService.TransactionalRepositorySetErrorRollback(dorothy.ID)
 			userService.TransactionalChangeCommit(dorothy.ID)
 			userService.ErrorAfterRollback(dorothy.ID)
 		})
 	})
+
+	Context("Type Splitting & Context Splitting", func() {
+		It("splits MongoDB connections by Entity Type T and coordinates multi-connection commit and rollback", func() {
+			GetContainer().Reset()
+
+			userClient, err := NewMongoClientBuilder().WithHost(mongoHost).WithPort(mongoPort).WithDirectConnection(true).Build()
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = userClient.Disconnect(context.Background()) })
+
+			animalClient, err := NewMongoClientBuilder().WithHost(mongoHost).WithPort(mongoPort).WithDirectConnection(true).Build()
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = animalClient.Disconnect(context.Background()) })
+
+			userDB := userClient.Database("type_split_users_db")
+			animalDB := animalClient.Database("type_split_animals_db")
+			Expect(userDB.Drop(context.Background())).NotTo(HaveOccurred())
+			Expect(animalDB.Drop(context.Background())).NotTo(HaveOccurred())
+
+			userRepo := &UserRepository{}
+			animalRepo := &AnimalRepository{}
+			AddBeamFor(&typeSplitMongoDatabases{userDB: userDB, animalDB: animalDB})
+			AddBeamFor(&typeSplitMongoConfig{})
+			AddBeamFor(userRepo)
+			AddBeamFor(animalRepo)
+			GetContainer().EnableScanning()
+			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
+
+			Expect(userRepo.Collection().Database().Name()).To(Equal("type_split_users_db"))
+			Expect(animalRepo.Collection().Database().Name()).To(Equal("type_split_animals_db"))
+
+			txMgr := GetBeamScopedInstance[TransactionManager]()
+
+			// 1. Coordinated multi-connection Commit across userDB (userClient) and animalDB (animalClient)
+			var savedUser *User
+			var savedAnimal *Animal
+			Expect(txMgr.Transactional(func() Error {
+				var saveErr Error
+				savedUser, saveErr = userRepo.Save(&User{Name: "Dorothy", UserName: "dorothy", Age: 25})
+				Expect(saveErr).NotTo(HaveOccurred())
+				savedAnimal, saveErr = animalRepo.Save(&Animal{Name: "Toto", UserID: savedUser.ID})
+				Expect(saveErr).NotTo(HaveOccurred())
+				return nil
+			})).NotTo(HaveOccurred())
+
+			Expect(userRepo.FindById(savedUser.ID).IsPresent()).To(BeTrue())
+			Expect(animalRepo.FindById(savedAnimal.ID).IsPresent()).To(BeTrue())
+
+			// 2. Coordinated multi-connection Rollback: error after saving in both rolls back BOTH connections
+			var rolledBackAnimal *Animal
+			Expect(txMgr.Transactional(func() Error {
+				u, saveErr := userRepo.Save(&User{Name: "Glinda", UserName: "glinda", Age: 30})
+				Expect(saveErr).NotTo(HaveOccurred())
+				rolledBackAnimal, saveErr = animalRepo.Save(&Animal{Name: "Lion", UserID: u.ID})
+				Expect(saveErr).NotTo(HaveOccurred())
+				return NewError("AbortBoth", "rollback both MongoDB connections")
+			})).To(HaveOccurred())
+
+			Expect(userRepo.FindByName("Glinda")).To(BeNil())
+			Expect(animalRepo.FindById(rolledBackAnimal.ID).IsPresent()).To(BeFalse())
+		})
+
+		It("splits MongoDB connections by Repository Type", func() {
+			GetContainer().Reset()
+
+			client, err := NewMongoClientBuilder().WithHost(mongoHost).WithPort(mongoPort).WithDirectConnection(true).Build()
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = client.Disconnect(context.Background()) })
+
+			userDB := client.Database("repo_split_users_db")
+			animalDB := client.Database("repo_split_animals_db")
+			Expect(userDB.Drop(context.Background())).NotTo(HaveOccurred())
+			Expect(animalDB.Drop(context.Background())).NotTo(HaveOccurred())
+
+			userRepo := &UserRepository{}
+			animalRepo := &AnimalRepository{}
+			AddBeamFor(&typeSplitMongoDatabases{userDB: userDB, animalDB: animalDB})
+			AddBeamFor(&repoTypeSplitMongoConfig{})
+			AddBeamFor(userRepo)
+			AddBeamFor(animalRepo)
+			GetContainer().EnableScanning()
+			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
+
+			Expect(userRepo.Collection().Database().Name()).To(Equal("repo_split_users_db"))
+			Expect(animalRepo.Collection().Database().Name()).To(Equal("repo_split_animals_db"))
+
+			u, err := userRepo.Save(&User{Name: "Oz", UserName: "oz", Age: 50})
+			Expect(err).NotTo(HaveOccurred())
+			a, err := animalRepo.Save(&Animal{Name: "Tiger", UserID: u.ID})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(userRepo.FindById(u.ID).IsPresent()).To(BeTrue())
+			Expect(animalRepo.FindById(a.ID).IsPresent()).To(BeTrue())
+
+			// Also verify helper functions on empty context and direct ParentType/ParentInstance context
+			Expect(MongoRepositoryTypeFromContext(context.Background())).To(BeNil())
+			Expect(MongoEntityTypeFromContext(context.Background())).To(BeNil())
+			parentCtx := context.WithValue(context.Background(), PrototypeContextParentType, reflect.TypeFor[*UserRepository]())
+			parentCtx = context.WithValue(parentCtx, PrototypeContextParentInstance, userRepo)
+			Expect(MongoRepositoryTypeFromContext(parentCtx)).To(Equal(reflect.TypeFor[*UserRepository]()))
+			Expect(MongoEntityTypeFromContext(parentCtx)).To(Equal(reflect.TypeFor[User]()))
+		})
+
+		It("splits MongoDB connections dynamically by context.Context via MongoTransactionalResolver and Foundry", func() {
+			GetContainer().Reset()
+
+			clientA, err := NewMongoClientBuilder().WithHost(mongoHost).WithPort(mongoPort).WithDirectConnection(true).Build()
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = clientA.Disconnect(context.Background()) })
+
+			clientB, err := NewMongoClientBuilder().WithHost(mongoHost).WithPort(mongoPort).WithDirectConnection(true).Build()
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = clientB.Disconnect(context.Background()) })
+
+			defaultDB := clientA.Database("ctx_split_default_db")
+			tenantADB := clientA.Database("ctx_split_tenant_a_db")
+			tenantBDB := clientB.Database("ctx_split_tenant_b_db")
+			Expect(defaultDB.Drop(context.Background())).NotTo(HaveOccurred())
+			Expect(tenantADB.Drop(context.Background())).NotTo(HaveOccurred())
+			Expect(tenantBDB.Drop(context.Background())).NotTo(HaveOccurred())
+
+			repo := &contextSplitUserRepository{}
+			AddBeamFor(&contextSplitMongoDatabases{
+				defaultDB: defaultDB,
+				tenantADB: tenantADB,
+				tenantBDB: tenantBDB,
+			})
+			AddBeamFor(&contextSplitMongoConfig{})
+			AddBeamFor(repo)
+			GetContainer().EnableScanning()
+			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
+
+			txMgr := GetBeamScopedInstance[TransactionManager]()
+
+			// Tenant A transaction
+			ctxA := context.WithValue(context.Background(), tenantKey, "tenantA")
+			txMgr.SetContext(ctxA)
+			Expect(txMgr.Transactional(func() Error {
+				_, saveErr := repo.Save(&User{Name: "AliceA", UserName: "alice_a", Age: 20})
+				Expect(saveErr).NotTo(HaveOccurred())
+				// Second call in same context hits goroutine txCache
+				Expect(repo.FindByName("AliceA")).NotTo(BeNil())
+				return nil
+			})).NotTo(HaveOccurred())
+			txMgr.ClearContext()
+
+			// Tenant B transaction
+			ctxB := context.WithValue(context.Background(), tenantKey, "tenantB")
+			txMgr.SetContext(ctxB)
+			Expect(txMgr.Transactional(func() Error {
+				// AliceA does not exist in Tenant B's database
+				Expect(repo.FindByName("AliceA")).To(BeNil())
+				_, saveErr := repo.Save(&User{Name: "BobB", UserName: "bob_b", Age: 30})
+				return saveErr
+			})).NotTo(HaveOccurred())
+			txMgr.ClearContext()
+
+			// Verify isolation between Tenant A, Tenant B, and Default DB
+			txMgr.SetContext(ctxA)
+			Expect(repo.FindByName("AliceA")).NotTo(BeNil())
+			Expect(repo.FindByName("BobB")).To(BeNil())
+			txMgr.ClearContext()
+
+			txMgr.SetContext(ctxB)
+			Expect(repo.FindByName("BobB")).NotTo(BeNil())
+			Expect(repo.FindByName("AliceA")).To(BeNil())
+			txMgr.ClearContext()
+
+			// Fallback to default transactionManager when resolver returns nil (no tenantKey in context)
+			Expect(repo.FindByName("AliceA")).To(BeNil())
+			Expect(repo.FindByName("BobB")).To(BeNil())
+
+			// Unknown tenant propagates Forge error and stops the transaction
+			ctxUnknown := context.WithValue(context.Background(), tenantKey, "unknownTenant")
+			txMgr.SetContext(ctxUnknown)
+			unknownErr := txMgr.Transactional(func() Error {
+				_, saveErr := repo.Save(&User{Name: "Blocked", UserName: "blocked", Age: 40})
+				return saveErr
+			})
+			Expect(unknownErr).To(HaveOccurred())
+			Expect(unknownErr.Name()).To(Equal("UnknownTenantError"))
+			txMgr.ClearContext()
+		})
+	})
 })
+
+type tenantCtxKey string
+
+const tenantKey tenantCtxKey = "tenant"
+
+type typeSplitMongoDatabases struct {
+	userDB   *mongo.Database
+	animalDB *mongo.Database
+}
+
+type typeSplitMongoConfig struct {
+	Configuration
+	dbs *typeSplitMongoDatabases `@:"Inject"`
+}
+
+func (this *typeSplitMongoConfig) Database(ctx context.Context) *mongo.Database {
+	if MongoEntityTypeFromContext(ctx) == reflect.TypeFor[Animal]() {
+		return this.dbs.animalDB
+	}
+	return this.dbs.userDB
+}
+
+type repoTypeSplitMongoConfig struct {
+	Configuration
+	dbs *typeSplitMongoDatabases `@:"Inject"`
+}
+
+func (this *repoTypeSplitMongoConfig) Database(ctx context.Context) *mongo.Database {
+	if MongoRepositoryTypeFromContext(ctx) == reflect.TypeFor[*AnimalRepository]() {
+		return this.dbs.animalDB
+	}
+	return this.dbs.userDB
+}
+
+type contextSplitUserRepository struct {
+	foundry    Foundry[MongoTransactional] `@:"Inject"`
+	findByName func(string) *User
+	MongoRepository[User, primitive.ObjectID]
+}
+
+var _ MongoTransactionalResolver = &contextSplitUserRepository{}
+
+func (this *contextSplitUserRepository) MongoTransactional(ctx context.Context) MongoTransactional {
+	if ctx.Value(tenantKey) == nil {
+		return nil
+	}
+	return RaiseVal(this.foundry.Forge(ctx))
+}
+
+func (this *contextSplitUserRepository) FindByName(name string) *User {
+	return this.findByName(name)
+}
+
+type contextSplitMongoDatabases struct {
+	defaultDB *mongo.Database
+	tenantADB *mongo.Database
+	tenantBDB *mongo.Database
+}
+
+type contextSplitMongoConfig struct {
+	Configuration
+	dbs *contextSplitMongoDatabases `@:"Inject"`
+}
+
+func (this *contextSplitMongoConfig) Database(ctx context.Context) (*mongo.Database, Error) {
+	switch ctx.Value(tenantKey) {
+	case nil:
+		return this.dbs.defaultDB, nil
+	case "tenantA":
+		return this.dbs.tenantADB, nil
+	case "tenantB":
+		return this.dbs.tenantBDB, nil
+	default:
+		return nil, NewError("UnknownTenantError", "unrecognized tenant in context")
+	}
+}
