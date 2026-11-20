@@ -2436,7 +2436,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			_, mutErr := mutPtrRepo.Save(mutEnt)
 			Expect(mutErr).To(HaveOccurred())
 			Expect(mutErr.Name()).To(Equal("IllegalArgumentError"))
-			Expect(mutEnt.ID).To(Equal(mutPtr))
+			Expect(mutEnt.ID).To(BeIdenticalTo(mutPtr))
 			Expect(*mutEnt.ID).To(Equal(primitive.NilObjectID))
 			Expect(mutOID).To(Equal(primitive.NilObjectID))
 
@@ -2447,7 +2447,7 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			_, mutBulkErr := mutPtrRepo.SaveAll([]*MutatingPtrIDEntity{mutBulkEnt})
 			Expect(mutBulkErr).To(HaveOccurred())
 			Expect(mutBulkErr.Name()).To(Equal("IllegalArgumentError"))
-			Expect(mutBulkEnt.ID).To(Equal(mutBulkPtr))
+			Expect(mutBulkEnt.ID).To(BeIdenticalTo(mutBulkPtr))
 			Expect(*mutBulkEnt.ID).To(Equal(primitive.NilObjectID))
 			Expect(mutBulkOID).To(Equal(primitive.NilObjectID))
 

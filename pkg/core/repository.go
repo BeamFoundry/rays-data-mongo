@@ -657,12 +657,12 @@ type entityMutation struct {
 func rollbackMutations(mutations []entityMutation) {
 	for i := len(mutations) - 1; i >= 0; i-- {
 		m := &mutations[i]
+		undoAllocations(m.allocated)
 		for _, p := range slices.Backward(m.pointers) {
 			if p.field.IsValid() && p.field.CanSet() && p.origVal.IsValid() {
 				p.field.Set(p.origVal)
 			}
 		}
-		undoAllocations(m.allocated)
 		if m.origVal.IsValid() && m.origID.IsValid() && m.origID.Kind() == reflect.Pointer && !m.origID.IsNil() {
 			if m.origID.Elem().CanSet() {
 				m.origID.Elem().Set(m.origVal)
