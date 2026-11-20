@@ -68,3 +68,8 @@ func ExportCollectionUseJSONStructTags(coll *mongo.Collection) bool {
 func ExportFindIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
 	return findIDField(v, useJSONTags...)
 }
+
+// ExportFindIDPath exposes findIDPath for testing.
+func ExportFindIDPath(t reflect.Type, useJSON bool) []int {
+	return findIDPath(t, useJSON)
+}

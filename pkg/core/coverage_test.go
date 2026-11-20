@@ -261,6 +261,25 @@ type SoleInlineEntity struct {
 
 type InlinePtrEntity struct {
 	Base *InlineBaseID `bson:",inline"`
+	Name string        `bson:"name"`
+}
+
+type InlinePtrRepo struct {
+	MongoRepository[InlinePtrEntity, primitive.ObjectID]
+}
+
+type ConflictingInlinePtrEntity struct {
+	Base *InlineBaseID      `bson:",inline"`
+	ID   primitive.ObjectID `bson:"_id,omitempty"`
+}
+
+type CannotRetainEntity struct {
+	ID   string `bson:"_id,omitempty"`
+	Name string `bson:"name"`
+}
+
+type CannotRetainRepo struct {
+	MongoRepository[CannotRetainEntity, string]
 }
 
 type DescEntity struct {
@@ -613,32 +632,34 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 
 	Context("Core Query, Repository, Builder, and Session Edge Cases", func() {
 		var (
-			richRepo       *RichRepository
-			cyclicRepo     *CyclicRepository
-			ptrNameRepo    *PtrNamerRepository
-			boxRepo        *BoxRepository
-			catRepo        *CategoryRepository
-			boyRepo        *BoyRepository
-			anyRepo        *AnyIDRepository
-			noIDRepo       *NoIDRepository
-			anonRepo       *AnonRepository
-			ptrEntRepo     *PtrEntityRepository
-			primRepo       *PrimitiveEntityRepository
-			userRepo       *UserRepository
-			likeRepo       *LikeRepo
-			inlineNoIDRepo *InlineNoIDRepository
-			workOrderRepo  *WorkOrderRepo
-			intIDRepo      *IntIDRepo
-			ptrIDRepo      *PtrIDRepo
-			teamRepo       *TeamOrderRepo
-			badMarshalRepo *BadMarshalRepo
-			nilOIDRepo     *NilOIDRepo
-			inlineMapRepo  *InlineMapRepo
-			descRepo       *DescRepo
-			ascFieldRepo   *AscFieldRepo
-			txMgr          MongoTransactional
-			db             *mongo.Database
-			client         *mongo.Client
+			richRepo         *RichRepository
+			cyclicRepo       *CyclicRepository
+			ptrNameRepo      *PtrNamerRepository
+			boxRepo          *BoxRepository
+			catRepo          *CategoryRepository
+			boyRepo          *BoyRepository
+			anyRepo          *AnyIDRepository
+			noIDRepo         *NoIDRepository
+			anonRepo         *AnonRepository
+			ptrEntRepo       *PtrEntityRepository
+			primRepo         *PrimitiveEntityRepository
+			userRepo         *UserRepository
+			likeRepo         *LikeRepo
+			inlineNoIDRepo   *InlineNoIDRepository
+			workOrderRepo    *WorkOrderRepo
+			intIDRepo        *IntIDRepo
+			ptrIDRepo        *PtrIDRepo
+			teamRepo         *TeamOrderRepo
+			badMarshalRepo   *BadMarshalRepo
+			nilOIDRepo       *NilOIDRepo
+			inlineMapRepo    *InlineMapRepo
+			descRepo         *DescRepo
+			ascFieldRepo     *AscFieldRepo
+			inlinePtrRepo    *InlinePtrRepo
+			cannotRetainRepo *CannotRetainRepo
+			txMgr            MongoTransactional
+			db               *mongo.Database
+			client           *mongo.Client
 		)
 
 		BeforeEach(func() {
@@ -665,6 +686,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			inlineMapRepo = &InlineMapRepo{}
 			descRepo = &DescRepo{}
 			ascFieldRepo = &AscFieldRepo{}
+			inlinePtrRepo = &InlinePtrRepo{}
+			cannotRetainRepo = &CannotRetainRepo{}
 			badInlineRepo := &BadInlineRepository{}
 
 			AddBeamFor(&TestMongoConfig{})
@@ -693,6 +716,8 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			AddBeamFor(inlineMapRepo)
 			AddBeamFor(descRepo)
 			AddBeamFor(ascFieldRepo)
+			AddBeamFor(inlinePtrRepo)
+			AddBeamFor(cannotRetainRepo)
 			GetContainer().EnableScanning()
 			Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 
@@ -2037,6 +2062,45 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 			ptrIDField := ExportFindIDField(reflect.ValueOf(nonNilPtrEntity))
 			Expect(ptrIDField.IsValid()).To(BeTrue())
 			Expect(ptrIDField.Addr().Pointer()).To(Equal(reflect.ValueOf(&nonNilPtrEntity.Base.ID).Pointer()))
+
+			// 28. Save and SaveAll with sole inline pointer entity initializes nil pointer and retains generated ID
+			savedSolePtr, err := inlinePtrRepo.Save(&InlinePtrEntity{Name: "sole-ptr-save"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(savedSolePtr.Base).NotTo(BeNil())
+			Expect(savedSolePtr.Base.ID.IsZero()).To(BeFalse())
+
+			savedSolePtrs, err := inlinePtrRepo.SaveAll([]*InlinePtrEntity{{Name: "sole-ptr-bulk-1"}, {Name: "sole-ptr-bulk-2"}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(savedSolePtrs).To(HaveLen(2))
+			Expect(savedSolePtrs[0].Base).NotTo(BeNil())
+			Expect(savedSolePtrs[0].Base.ID.IsZero()).To(BeFalse())
+			Expect(savedSolePtrs[1].Base).NotTo(BeNil())
+			Expect(savedSolePtrs[1].Base.ID.IsZero()).To(BeFalse())
+
+			Expect(inlinePtrRepo.Delete(savedSolePtr)).NotTo(HaveOccurred())
+			for _, d := range savedSolePtrs {
+				Expect(inlinePtrRepo.Delete(d)).NotTo(HaveOccurred())
+			}
+
+			// Save rejects write when entity cannot retain generated ID
+			_, cannotRetainErr := cannotRetainRepo.Save(&CannotRetainEntity{Name: "no-id-to-retain"})
+			Expect(cannotRetainErr).To(HaveOccurred())
+			Expect(cannotRetainErr.Name()).To(Equal("IllegalArgumentError"))
+			Expect(cannotRetainErr.Error()).To(ContainSubstring("Entity does not have a settable _id field to retain generated ID in Save"))
+
+			// Conflicting inline pointer entity: shallower ID wins without initializing nil Base pointer
+			confPtrEntity := &ConflictingInlinePtrEntity{Base: nil}
+			confPtrIDField := ExportFindIDField(reflect.ValueOf(confPtrEntity), false, true)
+			Expect(confPtrIDField.IsValid()).To(BeTrue())
+			Expect(confPtrIDField.Addr().Pointer()).To(Equal(reflect.ValueOf(&confPtrEntity.ID).Pointer()))
+			Expect(confPtrEntity.Base).To(BeNil())
+
+			// Unaddressable inline pointer entity returns invalid field when initializing path
+			unaddrVal := ExportFindIDField(reflect.ValueOf(InlinePtrEntity{}), false, true)
+			Expect(unaddrVal.IsValid()).To(BeFalse())
+
+			// Non-struct type for ExportFindIDPath returns nil
+			Expect(ExportFindIDPath(reflect.TypeFor[string](), false)).To(BeNil())
 
 			// Driver errors via Disconnect for Delete, DeleteById, Save (ReplaceOne + InsertOne), SaveAll, ExistsById
 			Expect(client.Disconnect(context.Background())).NotTo(HaveOccurred())

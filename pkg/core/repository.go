@@ -258,7 +258,17 @@ func (this *MongoRepository[T, K]) Save(object *T) (*T, Error) {
 		return object, nil
 	}
 
-	_ = assignGeneratedID(st.field)
+	useJSON := collectionUseJSONStructTags(coll)
+	hasIDPath := len(findIDPath(reflect.TypeOf(object), useJSON)) > 0
+
+	idField := st.field
+	if !idField.IsValid() && hasIDPath {
+		idField = findIDField(reflect.ValueOf(object), useJSON, true)
+	}
+	if hasIDPath && !assignGeneratedID(idField) {
+		return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in Save")
+	}
+	st.field = idField
 
 	res, driverErr := coll.InsertOne(ctx, object)
 	if driverErr != nil {
@@ -302,7 +312,11 @@ func (this *MongoRepository[T, K]) SaveAll(objects []*T) ([]*T, Error) {
 				SetReplacement(bson.Raw(st.docBytes)).
 				SetUpsert(true))
 		} else {
-			if !assignGeneratedID(st.field) {
+			idField := st.field
+			if !idField.IsValid() {
+				idField = findIDField(reflect.ValueOf(object), collectionUseJSONStructTags(coll), true)
+			}
+			if !assignGeneratedID(idField) {
 				return nil, NewError("IllegalArgumentError", "Entity does not have a settable _id field to retain generated ID in SaveAll")
 			}
 			models = append(models, mongo.NewInsertOneModel().SetDocument(object))
@@ -381,6 +395,77 @@ func collectionUseJSONStructTags(coll *mongo.Collection) bool {
 	return false
 }
 
+type idPathNode struct {
+	t    reflect.Type
+	path []int
+}
+
+func findIDPath(t reflect.Type, useJSON bool) []int {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+
+	visited := map[reflect.Type]bool{t: true}
+	currentLevel := []idPathNode{{t: t, path: nil}}
+	for len(currentLevel) > 0 {
+		var nextLevel []idPathNode
+
+		// Phase 1: Check direct fields at current level.
+		// Dominance rule: shallowest field matching _id wins over deeper inline fields.
+		for _, node := range currentLevel {
+			for i := range node.t.NumField() {
+				field := node.t.Field(i)
+				if !field.IsExported() {
+					continue
+				}
+				bsonName, inline, skip := parseBSONTag(&field, useJSON)
+				if skip || inline {
+					continue
+				}
+				if bsonName == bsonIDField {
+					res := make([]int, len(node.path), len(node.path)+1)
+					copy(res, node.path)
+					return append(res, i)
+				}
+			}
+		}
+
+		// Phase 2: If no direct _id field at this level, collect inline structs for next level.
+		for _, node := range currentLevel {
+			for i := range node.t.NumField() {
+				field := node.t.Field(i)
+				if !field.IsExported() {
+					continue
+				}
+				_, inline, skip := parseBSONTag(&field, useJSON)
+				if skip || !inline {
+					continue
+				}
+				ft := field.Type
+				for ft.Kind() == reflect.Pointer {
+					ft = ft.Elem()
+				}
+				if ft.Kind() == reflect.Struct && !visited[ft] {
+					visited[ft] = true
+					subPath := make([]int, len(node.path), len(node.path)+1)
+					copy(subPath, node.path)
+					nextLevel = append(nextLevel, idPathNode{
+						t:    ft,
+						path: append(subPath, i),
+					})
+				}
+			}
+		}
+
+		currentLevel = nextLevel
+	}
+
+	return nil
+}
+
 func findIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
 	for v.Kind() == reflect.Pointer {
 		if v.IsNil() {
@@ -393,59 +478,27 @@ func findIDField(v reflect.Value, useJSONTags ...bool) reflect.Value {
 	}
 
 	useJSON := len(useJSONTags) > 0 && useJSONTags[0]
+	initializePath := len(useJSONTags) > 1 && useJSONTags[1]
 
-	currentLevel := []reflect.Value{v}
-	for len(currentLevel) > 0 {
-		var nextLevel []reflect.Value
-
-		// Phase 1: Check direct fields at current level.
-		// Shallowest field matching _id wins over deeper inline fields (dominance rule).
-		for _, cur := range currentLevel {
-			t := cur.Type()
-			for i := range t.NumField() {
-				field := t.Field(i)
-				if !field.IsExported() {
-					continue
-				}
-				bsonName, inline, skip := parseBSONTag(&field, useJSON)
-				if skip || inline {
-					continue
-				}
-				if bsonName == bsonIDField {
-					return cur.Field(i)
-				}
-			}
+	path := findIDPath(v.Type(), useJSON)
+	cur := v
+	for k, idx := range path {
+		if k == len(path)-1 {
+			return cur.Field(idx)
 		}
-
-		// Phase 2: If no direct _id field at this level, collect inline structs for next level.
-		for _, cur := range currentLevel {
-			t := cur.Type()
-			for i := range t.NumField() {
-				field := t.Field(i)
-				if !field.IsExported() {
-					continue
+		sub := cur.Field(idx)
+		if sub.Kind() == reflect.Pointer {
+			if sub.IsNil() {
+				if !initializePath || !sub.CanSet() {
+					return reflect.Value{}
 				}
-				_, inline, skip := parseBSONTag(&field, useJSON)
-				if skip || !inline {
-					continue
-				}
-				sub := cur.Field(i)
-				for sub.Kind() == reflect.Pointer {
-					if sub.IsNil() {
-						break
-					}
-					sub = sub.Elem()
-				}
-				if sub.IsValid() && sub.Kind() == reflect.Struct {
-					nextLevel = append(nextLevel, sub)
-				}
+				sub.Set(reflect.New(sub.Type().Elem()))
 			}
+			sub = sub.Elem()
 		}
-
-		currentLevel = nextLevel
+		cur = sub
 	}
-	// Untagged "ID" fields are intentionally not selected as identity because the MongoDB driver
-	// only serializes fields to "_id" if explicitly tagged with bson:"_id" (or json:"_id" with UseJSONStructTags).
+
 	return reflect.Value{}
 }
 
