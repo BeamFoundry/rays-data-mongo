@@ -683,6 +683,19 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 			Expect(userRepository.queryAllByAgeBetween(20, 30).OrderByAsc("age").Distinct("age", &ages)).NotTo(HaveOccurred())
 			Expect(ages).To(ConsistOf(uint(25), uint(30)))
 
+			// Derived *MongoQuery executes lazily and propagates terminal errors to the captured transaction
+			txMgr := GetBeamScopedInstance[TransactionManager]()
+			txErr := txMgr.Transactional(func() Error {
+				_, saveErr := userRepository.Save(&User{Name: "LazyRollback", UserName: "lazy_rollback", Age: 28})
+				Expect(saveErr).NotTo(HaveOccurred())
+				q := userRepository.queryAllByAgeBetween(20, 30)
+				Expect(q.Error()).NotTo(HaveOccurred())
+				Expect(q.Find(nil)).To(HaveOccurred())
+				return nil
+			})
+			Expect(txErr).To(HaveOccurred())
+			Expect(userRepository.FindByName("LazyRollback")).To(BeNil())
+
 			type AgeStats struct {
 				Total int `bson:"total"`
 			}
@@ -897,7 +910,17 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 			Expect(repo.FindByName("AliceA")).To(BeNil())
 			Expect(repo.FindByName("BobB")).To(BeNil())
 
-			// Unknown tenant propagates Forge error and stops the transaction
+			// Context with incomparable dynamic value (TypeOf.Comparable() == true, ValueOf.Comparable() == false) avoids panic
+			incompCtx := dynamicPayloadCtx{
+				Context: ctxA,
+				payload: []string{"incomparable-slice-in-interface-field"},
+			}
+			txMgr.SetContext(incompCtx)
+			Expect(repo.FindByName("AliceA")).NotTo(BeNil())
+			Expect(repo.FindByName("AliceA")).NotTo(BeNil())
+			txMgr.ClearContext()
+
+			// Unknown tenant propagates routing failure and stops the transaction
 			ctxUnknown := context.WithValue(context.Background(), tenantKey, "unknownTenant")
 			txMgr.SetContext(ctxUnknown)
 			unknownErr := txMgr.Transactional(func() Error {
@@ -914,6 +937,11 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 type tenantCtxKey string
 
 const tenantKey tenantCtxKey = "tenant"
+
+type dynamicPayloadCtx struct {
+	context.Context
+	payload any
+}
 
 type typeSplitMongoDatabases struct {
 	userDB   *mongo.Database
@@ -956,7 +984,11 @@ func (this *contextSplitUserRepository) MongoTransactional(ctx context.Context) 
 	if ctx.Value(tenantKey) == nil {
 		return nil
 	}
-	return RaiseVal(this.foundry.Forge(ctx))
+	tx := RaiseVal(this.foundry.Forge(ctx))
+	if tx.Database() == nil {
+		RaiseErr(NewError("UnknownTenantError", "unrecognized tenant in context"))
+	}
+	return tx
 }
 
 func (this *contextSplitUserRepository) FindByName(name string) *User {

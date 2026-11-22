@@ -578,12 +578,23 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		Expect(standalone.Commit()).NotTo(HaveOccurred())
 		standalone.End()
 
-		// 8. Ambient session when no active session
+		// 8. SetError when txManager is configured but has no active transaction records error on current session and rolls it back
+		Expect(mgr.Start()).NotTo(HaveOccurred())
+		sInactiveCoord := mgr.Get()
+		Expect(sInactiveCoord.Session()).NotTo(BeNil())
+		mgr.SetError(NewError("LocalSessionErr", "coordinator inactive"))
+		Expect(txManager.Error()).NotTo(HaveOccurred())
+		Expect(mgr.Error()).To(HaveOccurred())
+		Expect(mgr.Error().Name()).To(Equal("LocalSessionErr"))
+		Expect(sInactiveCoord.Validate()).To(HaveOccurred())
+		mgr.End()
+
+		// 9. Ambient session when no active session
 		ambient := mgr.Get()
 		Expect(ambient.Session()).To(BeNil())
 		Expect(mgr.Error()).NotTo(HaveOccurred())
 
-		// 9. New(), WithDatabase(), Database(), and resolvedClient() fallbacks (database client and nil client)
+		// 10. New(), WithDatabase(), Database(), and resolvedClient() fallbacks (database client and nil client)
 		dbBackedMgr := MongoTransactionalManager{}.New().WithDatabase(client.Database("test_tx_db"))
 		Expect(dbBackedMgr.Database()).NotTo(BeNil())
 		Expect(dbBackedMgr.Database().Name()).To(Equal("test_tx_db"))
@@ -591,7 +602,7 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		Expect(dbBackedMgr.Get().Session()).NotTo(BeNil())
 		dbBackedMgr.End()
 
-		nilClientMgr := MongoTransactionalManager{}.New()
+		nilClientMgr := dbBackedMgr.WithDatabase(nil)
 		Expect(nilClientMgr.Database()).To(BeNil())
 		Expect(nilClientMgr.Start()).To(HaveOccurred())
 		nilClientMgr.End()

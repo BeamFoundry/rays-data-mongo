@@ -217,8 +217,12 @@ func (this *UserRepository) MongoTransactional(ctx context.Context) MongoTransac
     if ctx.Value(TenantKey) == nil {
         return nil // Intentional default route: falls back to the default injected MongoTransactional
     }
-    // Stop the operation and propagate any Forge routing failure rather than falling back to defaultDB
-    return RaiseVal(this.foundry.Forge(ctx))
+    // Stop the operation and propagate any Forge or database routing failure rather than falling back to defaultDB
+    tx := RaiseVal(this.foundry.Forge(ctx))
+    if tx.Database() == nil {
+        RaiseErr(NewError("UnknownTenantError", "unrecognized tenant in context"))
+    }
+    return tx
 }
 
 func (this *UserRepository) FindByName(name string) *User {

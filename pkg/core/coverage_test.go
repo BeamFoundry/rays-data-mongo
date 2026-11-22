@@ -785,9 +785,9 @@ var _ = Describe("Coverage Edge Cases", Ordered, func() {
 		Expect(db.Client().Disconnect(context.Background())).NotTo(HaveOccurred())
 		GetContainer().Reset()
 
-		// 2. No *mongo.Client or *mongo.Database beam -> MongoTxManager returns MongoConfigurationError
+		// 2. No *mongo.Client or *mongo.Database beam -> MongoTxManager is a prototype and does not fail initialization
 		GetContainer().EnableScanning()
-		Expect(GetContainer().Initialize()).To(HaveOccurred())
+		Expect(GetContainer().Initialize()).NotTo(HaveOccurred())
 		GetContainer().Reset()
 
 		// 3. Multiple MongoDB clients registered through a single Configuration with Primary + Qualifier

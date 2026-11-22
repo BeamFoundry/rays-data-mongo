@@ -123,9 +123,9 @@ func (this *MongoRepository[T, K]) tx() MongoTransactional {
 		return this.transactionManager
 	}
 	ctx := this.txManager.GetContext()
-	comparableCtx := reflect.TypeOf(ctx).Comparable()
+	comparableCtx := reflect.ValueOf(ctx).Comparable()
 	if this.txCache != nil && comparableCtx {
-		if entry := this.txCache.Get(); entry != nil && entry.tx != nil && entry.ctx == ctx {
+		if entry := this.txCache.Get(); entry != nil && entry.tx != nil && reflect.ValueOf(entry.ctx).Comparable() && entry.ctx == ctx {
 			return entry.tx
 		}
 	}

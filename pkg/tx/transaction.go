@@ -251,10 +251,10 @@ var (
 // MongoTransactionalManager manages goroutine-bound MongoDB sessions and transactions.
 // It has no Rays Stereotype so multiple instances can be instantiated or registered via Configuration.
 type MongoTransactionalManager struct {
-	client    *mongo.Client
-	database  *mongo.Database    `@:"Inject"`
 	txManager TransactionManager `@:"Inject"`
 	logger    Logging            `@:"Inject"`
+	client    *mongo.Client
+	database  Optional[*mongo.Database] `@:"Inject"`
 }
 
 var _ MongoTransactional = &MongoTransactionalManager{}
@@ -275,7 +275,11 @@ func NewMongoTransactionalManager(client *mongo.Client, logger Logging) *MongoTr
 // WithDatabase sets the [*mongo.Database] on this [MongoTransactionalManager]
 // and returns the receiver for fluent chaining.
 func (this *MongoTransactionalManager) WithDatabase(database *mongo.Database) *MongoTransactionalManager {
-	this.database = database
+	if database != nil {
+		this.database = OptionalOf(database)
+	} else {
+		this.database = OptionalEmpty[*mongo.Database]()
+	}
 	return this
 }
 
@@ -288,15 +292,18 @@ func (this *MongoTransactionalManager) WithTransactionManager(txManager Transact
 
 // Database returns the [*mongo.Database] bound to this [MongoTransactionalManager].
 func (this *MongoTransactionalManager) Database() *mongo.Database {
-	return this.database
+	if db, ok := this.database.Get(); ok {
+		return db
+	}
+	return nil
 }
 
 func (this *MongoTransactionalManager) resolvedClient() *mongo.Client {
 	if this.client != nil {
 		return this.client
 	}
-	if this.database != nil {
-		return this.database.Client()
+	if db := this.Database(); db != nil {
+		return db.Client()
 	}
 	return nil
 }
@@ -431,12 +438,12 @@ func (this *MongoTransactionalManager) End() {
 }
 
 // SetError records an [Error] on the active transaction and triggers rollback via the
-// coordinating [TransactionManager] (or directly on the active [MongoSession] if standalone).
+// coordinating [TransactionManager] when active (or directly on the active [MongoSession]).
 func (this *MongoTransactionalManager) SetError(err Error) {
 	if err == nil {
 		return
 	}
-	if this.txManager != nil {
+	if this.txManager != nil && this.txManager.IsActive() {
 		this.txManager.SetError(err)
 		return
 	}

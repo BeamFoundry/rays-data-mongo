@@ -547,6 +547,7 @@ func (this *mongoCompiledQuery[T, ID]) Query(
 		}
 
 		if output == reflect.TypeFor[*MongoQuery]() {
+			q = q.withErrorReporter(recordErr)
 			recordErr(q.Error())
 			return formatResult(reflect.ValueOf(q), q.Error())
 		}
