@@ -594,7 +594,44 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		Expect(ambient.Session()).To(BeNil())
 		Expect(mgr.Error()).NotTo(HaveOccurred())
 
-		// 10. New(), WithDatabase(), Database(), and resolvedClient() fallbacks (database client and nil client)
+		// 10. ReportSessionError: nil/ambient no-ops, coordinated scope forwarding, and captured outer session isolation from nested transactions
+		ambientSess := mgr.Get()
+		mgr.ReportSessionError(nil, NewError("IgnoredErr", "nil session"))
+		mgr.ReportSessionError(ambientSess, nil)
+		mgr.ReportSessionError(ambientSess, NewError("IgnoredErr", "ambient session"))
+		Expect(ambientSess.Error()).NotTo(HaveOccurred())
+
+		// Coordinated transaction: ReportSessionError in original scope forwards to txManager,
+		// while a retained ambient query cannot mark or roll back the coordinated transaction.
+		Expect(txManager.Transactional(func() Error {
+			mgr.ReportSessionError(ambientSess, NewError("RetainedAmbientErr", "must not affect active tx"))
+			Expect(txManager.Error()).NotTo(HaveOccurred())
+
+			coordSess := mgr.Get()
+			mgr.ReportSessionError(coordSess, NewError("CoordQueryErr", "fails original scope"))
+			Expect(txManager.Error()).To(HaveOccurred())
+			Expect(txManager.Error().Name()).To(Equal("CoordQueryErr"))
+			return nil
+		})).To(HaveOccurred())
+
+		// Nested transaction: ReportSessionError on outer session rolls back outer session without rolling back inner session or active coordinator
+		Expect(mgr.Start()).NotTo(HaveOccurred())
+		outerCap := mgr.Get()
+		Expect(mgr.Start()).NotTo(HaveOccurred())
+		innerCap := mgr.Get()
+		mgr.ReportSessionError(outerCap, NewError("OuterQueryErr", "outer query failed while inner active"))
+		mgr.ReportSessionError(outerCap, NewError("SecondOuterErr", "preserves first outer error"))
+		Expect(outerCap.Error()).To(HaveOccurred())
+		Expect(outerCap.Error().Name()).To(Equal("OuterQueryErr"))
+		Expect(outerCap.Validate()).To(HaveOccurred())
+		Expect(innerCap.Error()).NotTo(HaveOccurred())
+		Expect(innerCap.Validate()).NotTo(HaveOccurred())
+		Expect(mgr.Commit()).NotTo(HaveOccurred())
+		mgr.End()
+		Expect(mgr.Commit()).To(HaveOccurred())
+		mgr.End()
+
+		// 11. New(), WithDatabase(), Database(), and resolvedClient() fallbacks (database client and nil client)
 		dbBackedMgr := MongoTransactionalManager{}.New().WithDatabase(client.Database("test_tx_db"))
 		Expect(dbBackedMgr.Database()).NotTo(BeNil())
 		Expect(dbBackedMgr.Database().Name()).To(Equal("test_tx_db"))

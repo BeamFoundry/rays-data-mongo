@@ -683,7 +683,7 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 			Expect(userRepository.queryAllByAgeBetween(20, 30).OrderByAsc("age").Distinct("age", &ages)).NotTo(HaveOccurred())
 			Expect(ages).To(ConsistOf(uint(25), uint(30)))
 
-			// Derived *MongoQuery executes lazily and propagates terminal errors to the captured transaction
+			// Derived *MongoQuery and MongoRepository.Query() execute lazily and propagate terminal errors to the captured transaction
 			txMgr := GetBeamScopedInstance[TransactionManager]()
 			txErr := txMgr.Transactional(func() Error {
 				_, saveErr := userRepository.Save(&User{Name: "LazyRollback", UserName: "lazy_rollback", Age: 28})
@@ -695,6 +695,27 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 			})
 			Expect(txErr).To(HaveOccurred())
 			Expect(userRepository.FindByName("LazyRollback")).To(BeNil())
+
+			txErr = txMgr.Transactional(func() Error {
+				_, saveErr := userRepository.Save(&User{Name: "RepoQueryRollback", UserName: "repo_query_rollback", Age: 28})
+				Expect(saveErr).NotTo(HaveOccurred())
+				q := userRepository.Query()
+				Expect(q.Find(nil)).To(HaveOccurred())
+				return nil
+			})
+			Expect(txErr).To(HaveOccurred())
+			Expect(userRepository.FindByName("RepoQueryRollback")).To(BeNil())
+
+			// A retained query built outside a transaction cannot mark or roll back a later transaction
+			retainedAmbientQuery := userRepository.queryAllByAgeBetween(20, 30)
+			Expect(txMgr.Transactional(func() Error {
+				Expect(retainedAmbientQuery.Find(nil)).To(HaveOccurred())
+				_, saveErr := userRepository.Save(&User{Name: "SurvivesRetainedQuery", UserName: "survives_retained", Age: 29})
+				return saveErr
+			})).NotTo(HaveOccurred())
+			survived := userRepository.FindByName("SurvivesRetainedQuery")
+			Expect(survived).NotTo(BeNil())
+			Expect(userRepository.DeleteById(survived.ID)).NotTo(HaveOccurred())
 
 			type AgeStats struct {
 				Total int `bson:"total"`

@@ -521,12 +521,8 @@ func (this *mongoCompiledQuery[T, ID]) Query(
 
 	return func(in []reflect.Value) []reflect.Value {
 		tx, db := txAndDBProvider()
-		recordErr := func(err Error) {
-			if err != nil && tx != nil {
-				tx.SetError(err)
-			}
-		}
-		q := NewMongoQuery(tx.Get(), db, collectionName)
+		ctx, recordErr := newQueryErrorReporter(tx)
+		q := NewMongoQuery(ctx, db, collectionName)
 
 		filter, index := this.buildFilter(in)
 		if filter != nil {

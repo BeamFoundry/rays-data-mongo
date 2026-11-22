@@ -168,11 +168,18 @@ func (this *MongoRepository[T, K]) validateActiveSession() (context.Context, Err
 	return ms.Context(), nil
 }
 
-func (this *MongoRepository[T, K]) activeContext() context.Context {
-	if tx := this.tx(); tx != nil {
-		return tx.Get()
+func newQueryErrorReporter(tx MongoTransactional) (ctx context.Context, recordErr func(Error)) {
+	var sess *MongoSession
+	ctx = context.Background()
+	if tx != nil {
+		sess = tx.Get()
+		ctx = sess
 	}
-	return context.Background()
+	return ctx, func(err Error) {
+		if err != nil && tx != nil {
+			tx.ReportSessionError(sess, err)
+		}
+	}
 }
 
 func (this *MongoRepository[T, K]) resolveCollectionName() string {
@@ -225,9 +232,12 @@ func (this *MongoRepository[T, K]) Collection() *mongo.Collection {
 
 // Query creates a new [*MongoQuery] targeting T's collection with any active ThreadLocal transaction context.
 func (this *MongoRepository[T, K]) Query(queries ...MongoQueryFunc) *MongoQuery {
-	_, db := this.txAndDB()
-	q := NewMongoQuery(this.activeContext(), db, this.resolveCollectionName())
-	return q.Scopes(queries...)
+	tx, db := this.txAndDB()
+	ctx, recordErr := newQueryErrorReporter(tx)
+	q := NewMongoQuery(ctx, db, this.resolveCollectionName()).withErrorReporter(recordErr)
+	q = q.Scopes(queries...)
+	recordErr(q.Error())
+	return q
 }
 
 // FindById finds a document by its _id field and returns an [Optional] pointer.
