@@ -7,7 +7,7 @@ require (
 	github.com/onsi/ginkgo/v2 v2.34.0
 	github.com/onsi/gomega v1.44.0
 	github.com/testcontainers/testcontainers-go v0.45.0
-	github.com/testcontainers/testcontainers-go/modules/mongodb v0.44.0
+	github.com/testcontainers/testcontainers-go/modules/mongodb v0.45.0
 	github.com/timandy/routine v1.1.6
 	go.mongodb.org/mongo-driver v1.17.10
 )
