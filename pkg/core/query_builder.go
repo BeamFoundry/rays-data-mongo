@@ -544,22 +544,22 @@ func (this *mongoCompiledQuery[T, ID]) Query(
 
 		if output == reflect.TypeFor[*MongoQuery]() {
 			q = q.withErrorReporter(recordErr)
-			recordErr(q.Error())
+			recordErr(q.ctx, q.Error())
 			return formatResult(reflect.ValueOf(q), q.Error())
 		}
 
 		switch this.kind {
 		case queryKindCount:
 			count, err := q.Count()
-			recordErr(err)
+			recordErr(q.ctx, err)
 			return formatResult(reflect.ValueOf(count), err)
 		case queryKindExists:
 			exists, err := q.Exists()
-			recordErr(err)
+			recordErr(q.ctx, err)
 			return formatResult(reflect.ValueOf(exists), err)
 		case queryKindDelete:
 			deleted, err := q.Delete()
-			recordErr(err)
+			recordErr(q.ctx, err)
 			if errorOnly {
 				if err != nil {
 					return []reflect.Value{reflect.ValueOf(err)}
@@ -570,7 +570,7 @@ func (this *mongoCompiledQuery[T, ID]) Query(
 		default:
 			val, err := this.executeFind(q, multi, stream, optional)
 			if err != nil && (hasError || !errors.Is(err, mongo.ErrNoDocuments)) {
-				recordErr(err)
+				recordErr(q.ctx, err)
 			}
 			return formatResult(val, err)
 		}

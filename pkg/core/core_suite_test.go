@@ -717,6 +717,37 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 			Expect(survived).NotTo(BeNil())
 			Expect(userRepository.DeleteById(survived.ID)).NotTo(HaveOccurred())
 
+			// Rebinding a query via WithContext to an active MongoSession (directly or wrapped) reports errors to that session,
+			// while rebinding to a non-session context detaches error reporting from the transaction.
+			mongoTx := GetBeamScopedInstance[MongoTransactional]()
+			Expect(txMgr.Transactional(func() Error {
+				_, saveErr := userRepository.Save(&User{Name: "ReboundDirectRollback", UserName: "rebound_direct", Age: 29})
+				Expect(saveErr).NotTo(HaveOccurred())
+				Expect(retainedAmbientQuery.WithContext(mongoTx.Get()).Find(nil)).To(HaveOccurred())
+				return nil
+			})).To(HaveOccurred())
+			Expect(userRepository.FindByName("ReboundDirectRollback")).To(BeNil())
+
+			Expect(txMgr.Transactional(func() Error {
+				_, saveErr := userRepository.Save(&User{Name: "ReboundWrappedRollback", UserName: "rebound_wrapped", Age: 29})
+				Expect(saveErr).NotTo(HaveOccurred())
+				wrappedSessCtx, cancel := context.WithTimeout(mongoTx.Get(), 5*time.Second)
+				defer cancel()
+				Expect(retainedAmbientQuery.WithContext(wrappedSessCtx).Find(nil)).To(HaveOccurred())
+				return nil
+			})).To(HaveOccurred())
+			Expect(userRepository.FindByName("ReboundWrappedRollback")).To(BeNil())
+
+			Expect(txMgr.Transactional(func() Error {
+				inTxQuery := userRepository.Query()
+				Expect(inTxQuery.WithContext(context.Background()).Find(nil)).To(HaveOccurred())
+				_, saveErr := userRepository.Save(&User{Name: "DetachedQuerySurvives", UserName: "detached_survives", Age: 29})
+				return saveErr
+			})).NotTo(HaveOccurred())
+			detachedSurvived := userRepository.FindByName("DetachedQuerySurvives")
+			Expect(detachedSurvived).NotTo(BeNil())
+			Expect(userRepository.DeleteById(detachedSurvived.ID)).NotTo(HaveOccurred())
+
 			type AgeStats struct {
 				Total int `bson:"total"`
 			}

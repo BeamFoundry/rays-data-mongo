@@ -379,7 +379,10 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		msMock := NewMongoSession(context.Background(), mockSess)
 		Expect(msMock.Commit()).To(HaveOccurred())
 		Expect(mockSess.commitCalls).To(Equal(1))
-		Expect(msMock.Validate()).To(HaveOccurred()) // commitPending is true
+		valErr := msMock.Validate()
+		Expect(valErr).To(HaveOccurred()) // commitPending is true
+		// Reporting a query validation failure while commitPending is true must not cache a terminal error
+		NewMongoTransactionalManager(client, nil).ReportSessionError(msMock, valErr)
 		Expect(msMock.Error()).NotTo(HaveOccurred()) // Not cached, retry allowed
 		Expect(msMock.Rollback()).To(HaveOccurred()) // Cannot rollback with pending commit result
 		mockSess.commitErr = nil

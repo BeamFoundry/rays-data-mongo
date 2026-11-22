@@ -168,16 +168,23 @@ func (this *MongoRepository[T, K]) validateActiveSession() (context.Context, Err
 	return ms.Context(), nil
 }
 
-func newQueryErrorReporter(tx MongoTransactional) (ctx context.Context, recordErr func(Error)) {
+// newQueryErrorReporter captures the active [MongoSession] from tx at query construction time
+// and returns an error-reporting callback that reports errors to that session, or to any session
+// subsequently rebound on the query via [MongoQuery.WithContext].
+func newQueryErrorReporter(tx MongoTransactional) (ctx context.Context, recordErr func(context.Context, Error)) {
 	var sess *MongoSession
 	ctx = context.Background()
 	if tx != nil {
 		sess = tx.Get()
 		ctx = sess
 	}
-	return ctx, func(err Error) {
+	return ctx, func(queryCtx context.Context, err Error) {
 		if err != nil && tx != nil {
-			tx.ReportSessionError(sess, err)
+			target := sess
+			if queryCtx != nil && queryCtx != ctx {
+				target = extractSession(queryCtx)
+			}
+			tx.ReportSessionError(target, err)
 		}
 	}
 }
@@ -231,12 +238,14 @@ func (this *MongoRepository[T, K]) Collection() *mongo.Collection {
 }
 
 // Query creates a new [*MongoQuery] targeting T's collection with any active ThreadLocal transaction context.
+// Terminal query errors are reported to the session captured by Query, or to the session rebound via
+// [MongoQuery.WithContext].
 func (this *MongoRepository[T, K]) Query(queries ...MongoQueryFunc) *MongoQuery {
 	tx, db := this.txAndDB()
 	ctx, recordErr := newQueryErrorReporter(tx)
 	q := NewMongoQuery(ctx, db, this.resolveCollectionName()).withErrorReporter(recordErr)
 	q = q.Scopes(queries...)
-	recordErr(q.Error())
+	recordErr(q.ctx, q.Error())
 	return q
 }
 

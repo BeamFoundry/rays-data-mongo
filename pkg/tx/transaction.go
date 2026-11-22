@@ -43,8 +43,9 @@ func NewMongoSession(ctx context.Context, session mongo.Session) *MongoSession {
 		baseCtx = mongo.NewSessionContext(baseCtx, session)
 	}
 	return &MongoSession{
-		ctx:     baseCtx,
-		session: session,
+		ctx:           baseCtx,
+		session:       session,
+		transactional: session != nil,
 	}
 }
 
@@ -456,7 +457,7 @@ func (this *MongoTransactionalManager) SetError(err Error) {
 		this.txManager.SetError(err)
 		return
 	}
-	if ms := this.currentSession(); ms != nil {
+	if ms := this.currentSession(); ms != nil && !ms.commitPending {
 		if ms.Error() == nil {
 			ms.SetError(err)
 		}
@@ -465,13 +466,14 @@ func (this *MongoTransactionalManager) SetError(err Error) {
 	}
 }
 
-// ReportSessionError records an [Error] against the [MongoSession] captured when a query was built.
-// When the captured session belongs to the currently active coordinated transaction scope, the error
+// ReportSessionError records an [Error] against the [MongoSession] bound to a query.
+// When the session belongs to the currently active coordinated transaction scope, the error
 // is forwarded to the coordinating [TransactionManager]; otherwise, the error is recorded directly on
-// the captured transactional session and that session is rolled back without affecting any later or
-// nested transaction.
+// the transactional session and that session is rolled back without affecting any later or
+// nested transaction. While commitPending is true, validation errors are not cached so later
+// Commit calls remain able to retry commit recovery.
 func (this *MongoTransactionalManager) ReportSessionError(sess *MongoSession, err Error) {
-	if err == nil || sess == nil || !sess.transactional {
+	if err == nil || sess == nil || !sess.transactional || sess.commitPending {
 		return
 	}
 	if sess.coordinated && this.txManager != nil && this.txManager.IsActive() && this.currentSession() == sess {

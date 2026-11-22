@@ -37,7 +37,7 @@ type MongoQuery struct {
 	validator      interface{ Validate() Error }
 	err            Error
 	hint           any
-	onError        func(Error)
+	onError        func(context.Context, Error)
 	collation      *options.Collation
 	maxTime        *time.Duration
 	skip           *int64
@@ -49,6 +49,18 @@ type MongoQuery struct {
 	sort           bson.D
 	projection     bson.D
 	extraFindOpts  []*options.FindOptions
+}
+
+func extractSession(ctx context.Context) *tx.MongoSession {
+	if s, ok := ctx.(*tx.MongoSession); ok {
+		return s
+	}
+	if ctx != nil {
+		if s, ok := ctx.Value((*tx.MongoSession)(nil)).(*tx.MongoSession); ok {
+			return s
+		}
+	}
+	return nil
 }
 
 func extractValidator(ctx context.Context) interface{ Validate() Error } {
@@ -134,6 +146,9 @@ func (this *MongoQuery) Scopes(funcs ...MongoQueryFunc) *MongoQuery {
 }
 
 // WithContext returns a copy of the query using the provided [context.Context].
+// If ctx is (or wraps) a [*tx.MongoSession], session validation and terminal error
+// reporting are rebound to that session; if ctx does not carry a [*tx.MongoSession],
+// terminal error reporting is detached from the previously captured session.
 func (this *MongoQuery) WithContext(ctx context.Context) *MongoQuery {
 	q := this.clone()
 	if ctx != nil {
@@ -456,7 +471,7 @@ func (this *MongoQuery) findOneOptions() *options.FindOneOptions {
 	return opt
 }
 
-func (this *MongoQuery) withErrorReporter(fn func(Error)) *MongoQuery {
+func (this *MongoQuery) withErrorReporter(fn func(context.Context, Error)) *MongoQuery {
 	q := this.clone()
 	q.onError = fn
 	return q
@@ -464,7 +479,7 @@ func (this *MongoQuery) withErrorReporter(fn func(Error)) *MongoQuery {
 
 func (this *MongoQuery) reportError(err Error) Error {
 	if this != nil && this.onError != nil {
-		this.onError(err)
+		this.onError(this.ctx, err)
 	}
 	return err
 }
