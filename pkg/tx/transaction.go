@@ -22,12 +22,13 @@ type MongoSession struct {
 	ctx           context.Context
 	session       mongo.Session
 	err           Error
+	coordinator   TransactionManager
+	owner         *MongoTransactionalManager
 	committed     bool
 	aborted       bool
 	ended         bool
 	commitPending bool
 	transactional bool
-	coordinated   bool
 }
 
 var _ context.Context = &MongoSession{}
@@ -78,6 +79,27 @@ func (this *MongoSession) SetError(err Error) {
 	if this != nil {
 		this.err = err
 	}
+}
+
+// ReportError records an [Error] against this [MongoSession].
+// When this session belongs to its owning manager's currently active coordinated transaction scope,
+// the error is forwarded to the session's coordinating [TransactionManager]; otherwise, the error
+// is recorded directly on this transactional session and the session is rolled back without
+// affecting any later or nested transaction. While commitPending is true, validation errors are
+// not cached so later Commit calls remain able to retry commit recovery.
+func (this *MongoSession) ReportError(err Error) {
+	if err == nil || this == nil || !this.transactional || this.commitPending {
+		return
+	}
+	if this.owner != nil && this.coordinator != nil && this.owner.txManager == this.coordinator && this.coordinator.IsActive() && this.owner.currentSession() == this {
+		this.coordinator.SetError(err)
+		return
+	}
+	if this.Error() == nil {
+		this.SetError(err)
+	}
+	//nolint:errcheck // Primary error is already recorded on the session
+	_ = this.Rollback()
 }
 
 // Validate returns an [Error] if this session has failed or already been committed or rolled back.
@@ -379,6 +401,7 @@ func (this *MongoTransactionalManager) Start() Error {
 	}); err != nil {
 		txErr := NewWrappedError("TransactionError", err)
 		ms := NewMongoSession(baseCtx, nil)
+		ms.owner = this
 		ms.transactional = true
 		ms.SetError(txErr)
 		this.pushSession(ms)
@@ -386,6 +409,7 @@ func (this *MongoTransactionalManager) Start() Error {
 	}
 
 	ms := NewMongoSession(baseCtx, sess)
+	ms.owner = this
 	ms.transactional = true
 	this.pushSession(ms)
 	return nil
@@ -423,18 +447,22 @@ func (this *MongoTransactionalManager) Get() *MongoSession {
 	if this.txManager != nil && this.txManager.IsActive() {
 		if err := this.txManager.Enlist(this); err != nil {
 			if ms := this.currentSession(); ms != nil {
-				ms.coordinated = true
+				ms.coordinator = this.txManager
 				return ms
 			}
 			ms := NewMongoSession(this.activeContext(), nil)
+			ms.owner = this
+			ms.coordinator = this.txManager
 			ms.SetError(err)
 			return ms
 		}
 		ms := this.currentSession()
-		ms.coordinated = true
+		ms.coordinator = this.txManager
 		return ms
 	}
-	return NewMongoSession(this.activeContext(), nil)
+	ms := NewMongoSession(this.activeContext(), nil)
+	ms.owner = this
+	return ms
 }
 
 // End closes any active session on the current goroutine and clears the session binding.
@@ -466,25 +494,12 @@ func (this *MongoTransactionalManager) SetError(err Error) {
 	}
 }
 
-// ReportSessionError records an [Error] against the [MongoSession] bound to a query.
-// When the session belongs to the currently active coordinated transaction scope, the error
-// is forwarded to the coordinating [TransactionManager]; otherwise, the error is recorded directly on
-// the transactional session and that session is rolled back without affecting any later or
-// nested transaction. While commitPending is true, validation errors are not cached so later
-// Commit calls remain able to retry commit recovery.
+// ReportSessionError records an [Error] against the [MongoSession] bound to a query, dispatching
+// through the session's owning [MongoTransactionalManager] and coordinating [TransactionManager]
+// when the session belongs to that owner's currently active coordinated transaction scope, or
+// rolling back the transactional session directly while preserving commitPending retry recovery.
 func (this *MongoTransactionalManager) ReportSessionError(sess *MongoSession, err Error) {
-	if err == nil || sess == nil || !sess.transactional || sess.commitPending {
-		return
-	}
-	if sess.coordinated && this.txManager != nil && this.txManager.IsActive() && this.currentSession() == sess {
-		this.txManager.SetError(err)
-		return
-	}
-	if sess.Error() == nil {
-		sess.SetError(err)
-	}
-	//nolint:errcheck // Primary error is already recorded on the session
-	_ = sess.Rollback()
+	sess.ReportError(err)
 }
 
 // Error returns the [Error] recorded on the coordinating [TransactionManager] or active [MongoSession].

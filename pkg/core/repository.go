@@ -170,7 +170,10 @@ func (this *MongoRepository[T, K]) validateActiveSession() (context.Context, Err
 
 // newQueryErrorReporter captures the active [MongoSession] from tx at query construction time
 // and returns an error-reporting callback that reports errors to that session, or to any session
-// subsequently rebound on the query via [MongoQuery.WithContext].
+// subsequently rebound on the query via [MongoQuery.WithContext], dispatching through the
+// manager and coordinator that own the target session.
+//
+//nolint:contextcheck // Session rollback uses a bounded cleanup context independent of the query context
 func newQueryErrorReporter(tx MongoTransactional) (ctx context.Context, recordErr func(context.Context, Error)) {
 	var sess *MongoSession
 	ctx = context.Background()
@@ -179,13 +182,11 @@ func newQueryErrorReporter(tx MongoTransactional) (ctx context.Context, recordEr
 		ctx = sess
 	}
 	return ctx, func(queryCtx context.Context, err Error) {
-		if err != nil && tx != nil {
-			target := sess
-			if queryCtx != nil && queryCtx != ctx {
-				target = extractSession(queryCtx)
-			}
-			tx.ReportSessionError(target, err)
+		target := sess
+		if queryCtx != nil && queryCtx != ctx {
+			target = extractSession(queryCtx)
 		}
+		target.ReportError(err)
 	}
 }
 

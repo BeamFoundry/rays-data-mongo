@@ -962,6 +962,20 @@ var _ = Describe("Rays Data Mongo", Ordered, func() {
 			Expect(repo.FindByName("AliceA")).To(BeNil())
 			Expect(repo.FindByName("BobB")).To(BeNil())
 
+			// Query created under the default manager (clientA) and rebound via WithContext to Tenant B's session (clientB)
+			// dispatches terminal errors through Tenant B's owning manager and coordinator.
+			defaultQuery := repo.Query()
+			txMgr.SetContext(ctxB)
+			Expect(txMgr.Transactional(func() Error {
+				_, saveErr := repo.Save(&User{Name: "CrossMgrRollbackB", UserName: "cross_mgr_b", Age: 31})
+				Expect(saveErr).NotTo(HaveOccurred())
+				sessB := repo.MongoTransactional(ctxB).Get()
+				Expect(defaultQuery.WithContext(sessB).Find(nil)).To(HaveOccurred())
+				return nil
+			})).To(HaveOccurred())
+			Expect(repo.FindByName("CrossMgrRollbackB")).To(BeNil())
+			txMgr.ClearContext()
+
 			// Context with incomparable dynamic value (TypeOf.Comparable() == true, ValueOf.Comparable() == false) avoids panic
 			incompCtx := dynamicPayloadCtx{
 				Context: ctxA,
