@@ -19,6 +19,7 @@
 package rays_data_mongo //nolint:revive // Ignoring package naming hint
 
 import (
+	_ "github.com/BeamFoundry/rays"                                // rays
 	_ "github.com/BeamFoundry/rays-data-mongo/internal/autoconfig" // autoconfig
 	_ "github.com/BeamFoundry/rays-data-mongo/pkg/core"            // core
 	_ "github.com/BeamFoundry/rays-data-mongo/pkg/tx"              // tx

@@ -143,7 +143,7 @@ var _ = Describe("UserRepository", Ordered, func() {
 
     It("writes and reads documents with transactional rollback isolation", func() {
         repo := GetBeamScopedInstance[*repositories.UserRepository]()
-        txMgr := GetBeamScopedInstance[MongoTransactional]()
+        txMgr := GetBeamScopedInstance[TransactionManager]()
 
         // Standard write and read against the replica set
         saved, err := repo.Save(&repositories.User{Name: "Alice", Age: 30})
@@ -157,13 +157,14 @@ var _ = Describe("UserRepository", Ordered, func() {
         // Document saved in a rolled-back transaction is not visible outside
         var saveSucceeded bool
         var bob *repositories.User
-        txMgr.Transactional(context.Background(), func(_ *MongoSession) Error {
+        txErr := txMgr.Transactional(func() Error {
             var saveErr Error
             bob, saveErr = repo.Save(&repositories.User{Name: "Bob", Age: 25})
             Expect(saveErr).NotTo(HaveOccurred())
             saveSucceeded = true
             return NewError("RollbackError", "abort transaction")
         })
+        Expect(txErr).To(HaveOccurred())
         Expect(saveSucceeded).To(BeTrue())
 
         exists, err := repo.ExistsById(bob.ID)

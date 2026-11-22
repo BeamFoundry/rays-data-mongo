@@ -3,7 +3,6 @@ package tx
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -23,10 +22,13 @@ type MongoSession struct {
 	ctx           context.Context
 	session       mongo.Session
 	err           Error
+	coordinator   TransactionManager
+	owner         *MongoTransactionalManager
 	committed     bool
 	aborted       bool
 	ended         bool
 	commitPending bool
+	transactional bool
 }
 
 var _ context.Context = &MongoSession{}
@@ -42,8 +44,9 @@ func NewMongoSession(ctx context.Context, session mongo.Session) *MongoSession {
 		baseCtx = mongo.NewSessionContext(baseCtx, session)
 	}
 	return &MongoSession{
-		ctx:     baseCtx,
-		session: session,
+		ctx:           baseCtx,
+		session:       session,
+		transactional: session != nil,
 	}
 }
 
@@ -76,6 +79,27 @@ func (this *MongoSession) SetError(err Error) {
 	if this != nil {
 		this.err = err
 	}
+}
+
+// ReportError records an [Error] against this [MongoSession].
+// When this session belongs to its owning manager's currently active coordinated transaction scope,
+// the error is forwarded to the session's coordinating [TransactionManager]; otherwise, the error
+// is recorded directly on this transactional session and the session is rolled back without
+// affecting any later or nested transaction. While commitPending is true, validation errors are
+// not cached so later Commit calls remain able to retry commit recovery.
+func (this *MongoSession) ReportError(err Error) {
+	if err == nil || this == nil || !this.transactional || this.commitPending {
+		return
+	}
+	if this.owner != nil && this.coordinator != nil && this.owner.txManager == this.coordinator && this.coordinator.IsActive() && this.owner.currentSession() == this {
+		this.coordinator.SetError(err)
+		return
+	}
+	if this.Error() == nil {
+		this.SetError(err)
+	}
+	//nolint:errcheck // Primary error is already recorded on the session
+	_ = this.Rollback()
 }
 
 // Validate returns an [Error] if this session has failed or already been committed or rolled back.
@@ -240,71 +264,205 @@ func (this *MongoSession) Value(key any) any {
 // MongoTransactional represents the interface of a [Transactional] manager for [MongoSession].
 type MongoTransactional interface {
 	Transactional[MongoSession]
+	// Database returns the [*mongo.Database] associated with this transactional manager, if configured.
+	Database() *mongo.Database
+	// ReportSessionError records an [Error] against the captured [MongoSession] from when a query was built.
+	ReportSessionError(sess *MongoSession, err Error)
 }
+
+var (
+	activeSessionsMu sync.Mutex
+	activeSessions   = make(map[uint64]map[*mongo.Client][]*MongoSession)
+)
 
 // MongoTransactionalManager manages goroutine-bound MongoDB sessions and transactions.
 // It has no Rays Stereotype so multiple instances can be instantiated or registered via Configuration.
 type MongoTransactionalManager struct {
-	client   *mongo.Client
-	logger   Logging
-	sessions map[uint64][]*MongoSession
-	mu       sync.Mutex
+	txManager TransactionManager `@:"Inject"`
+	logger    Logging            `@:"Inject"`
+	client    *mongo.Client
+	database  Optional[*mongo.Database] `@:"Inject"`
 }
 
 var _ MongoTransactional = &MongoTransactionalManager{}
 
+// New creates a new [MongoTransactionalManager] for Prototype registration in [Configuration] Beams.
+func (this MongoTransactionalManager) New() *MongoTransactionalManager {
+	return &this
+}
+
 // NewMongoTransactionalManager creates a new [MongoTransactionalManager] for the given [*mongo.Client] and [Logging].
 func NewMongoTransactionalManager(client *mongo.Client, logger Logging) *MongoTransactionalManager {
 	return &MongoTransactionalManager{
-		client:   client,
-		logger:   logger,
-		sessions: make(map[uint64][]*MongoSession),
+		client: client,
+		logger: logger,
 	}
 }
 
-// Start begins a new MongoDB session and transaction and binds it to the current goroutine.
-func (this *MongoTransactionalManager) Start(ctx context.Context) *MongoSession {
-	//nolint:contextcheck // Fallback to background context when caller passes nil
-	baseCtx := ctx
-	if baseCtx == nil {
-		baseCtx = context.Background()
+// WithDatabase sets the [*mongo.Database] on this [MongoTransactionalManager]
+// and returns the receiver for fluent chaining.
+func (this *MongoTransactionalManager) WithDatabase(database *mongo.Database) *MongoTransactionalManager {
+	if database != nil {
+		this.database = OptionalOf(database)
+	} else {
+		this.database = OptionalEmpty[*mongo.Database]()
 	}
+	return this
+}
+
+// WithTransactionManager sets the coordinating [TransactionManager] on this [MongoTransactionalManager]
+// and returns the receiver for fluent chaining.
+func (this *MongoTransactionalManager) WithTransactionManager(txManager TransactionManager) *MongoTransactionalManager {
+	this.txManager = txManager
+	return this
+}
+
+// Database returns the [*mongo.Database] bound to this [MongoTransactionalManager].
+func (this *MongoTransactionalManager) Database() *mongo.Database {
+	if db, ok := this.database.Get(); ok {
+		return db
+	}
+	return nil
+}
+
+func (this *MongoTransactionalManager) resolvedClient() *mongo.Client {
+	if this.client != nil {
+		return this.client
+	}
+	if db := this.Database(); db != nil {
+		return db.Client()
+	}
+	return nil
+}
+
+func (this *MongoTransactionalManager) activeContext() context.Context {
+	if this.txManager != nil {
+		return this.txManager.GetContext()
+	}
+	return context.Background()
+}
+
+func (this *MongoTransactionalManager) currentSession() *MongoSession {
+	goid := routine.Goid()
+	client := this.resolvedClient()
+	activeSessionsMu.Lock()
+	defer activeSessionsMu.Unlock()
+	if stack := activeSessions[goid][client]; len(stack) > 0 {
+		return stack[len(stack)-1]
+	}
+	return nil
+}
+
+func (this *MongoTransactionalManager) pushSession(ms *MongoSession) {
+	goid := routine.Goid()
+	client := this.resolvedClient()
+	activeSessionsMu.Lock()
+	defer activeSessionsMu.Unlock()
+	byClient := activeSessions[goid]
+	if byClient == nil {
+		byClient = make(map[*mongo.Client][]*MongoSession)
+		activeSessions[goid] = byClient
+	}
+	byClient[client] = append(byClient[client], ms)
+}
+
+func (this *MongoTransactionalManager) popSession() *MongoSession {
+	goid := routine.Goid()
+	client := this.resolvedClient()
+	activeSessionsMu.Lock()
+	defer activeSessionsMu.Unlock()
+	byClient := activeSessions[goid]
+	if stack := byClient[client]; len(stack) > 0 {
+		ms := stack[len(stack)-1]
+		if len(stack) == 1 {
+			delete(byClient, client)
+			if len(byClient) == 0 {
+				delete(activeSessions, goid)
+			}
+		} else {
+			byClient[client] = stack[:len(stack)-1]
+		}
+		return ms
+	}
+	return nil
+}
+
+// Start begins a new MongoDB session and transaction and binds it to the current goroutine.
+func (this *MongoTransactionalManager) Start() Error {
+	baseCtx := this.activeContext()
 	if this.logger != nil {
 		this.logger.Trace("Start Transaction", "manager", "MongoTransactionalManager")
 	}
 
 	var sess mongo.Session
 	if err := Try(func() {
-		sess = RaiseVal(this.client.StartSession())
+		sess = RaiseVal(this.resolvedClient().StartSession())
 		RaiseErr(sess.StartTransaction())
 	}); err != nil {
+		txErr := NewWrappedError("TransactionError", err)
 		ms := NewMongoSession(baseCtx, nil)
-		ms.SetError(NewWrappedError("TransactionError", err))
-		return ms
+		ms.owner = this
+		ms.transactional = true
+		ms.SetError(txErr)
+		this.pushSession(ms)
+		return txErr
 	}
 
 	ms := NewMongoSession(baseCtx, sess)
-	goid := routine.Goid()
-	this.mu.Lock()
-	this.sessions[goid] = append(this.sessions[goid], ms)
-	this.mu.Unlock()
-	return ms
+	ms.owner = this
+	ms.transactional = true
+	this.pushSession(ms)
+	return nil
 }
 
-// Get returns the active [MongoSession] for the current goroutine, or an ambient background session.
-func (this *MongoTransactionalManager) Get() *MongoSession {
-	goid := routine.Goid()
-	this.mu.Lock()
-	stack := this.sessions[goid]
-	var ms *MongoSession
-	if len(stack) > 0 {
-		ms = stack[len(stack)-1]
+// Commit commits the active MongoDB transaction on the current goroutine.
+func (this *MongoTransactionalManager) Commit() Error {
+	if this.logger != nil {
+		this.logger.Trace("Commit Transaction", "manager", "MongoTransactionalManager")
 	}
-	this.mu.Unlock()
-	if ms != nil {
+	if ms := this.currentSession(); ms != nil {
+		return ms.Commit()
+	}
+	return NewError("TransactionError", "No active session")
+}
+
+// Rollback aborts the active MongoDB transaction on the current goroutine.
+func (this *MongoTransactionalManager) Rollback() Error {
+	if this.logger != nil {
+		this.logger.Trace("Rollback Transaction", "manager", "MongoTransactionalManager")
+	}
+	if ms := this.currentSession(); ms != nil {
+		return ms.Rollback()
+	}
+	return NewError("TransactionError", "No active session")
+}
+
+// Get returns the active [MongoSession] for the current goroutine, lazily enlisting in
+// the [TransactionManager] if a coordinated transaction is active, or returning an
+// ambient session bound to the current goroutine's context.
+func (this *MongoTransactionalManager) Get() *MongoSession {
+	if ms := this.currentSession(); ms != nil {
 		return ms
 	}
-	return NewMongoSession(context.Background(), nil)
+	if this.txManager != nil && this.txManager.IsActive() {
+		if err := this.txManager.Enlist(this); err != nil {
+			if ms := this.currentSession(); ms != nil {
+				ms.coordinator = this.txManager
+				return ms
+			}
+			ms := NewMongoSession(this.activeContext(), nil)
+			ms.owner = this
+			ms.coordinator = this.txManager
+			ms.SetError(err)
+			return ms
+		}
+		ms := this.currentSession()
+		ms.coordinator = this.txManager
+		return ms
+	}
+	ms := NewMongoSession(this.activeContext(), nil)
+	ms.owner = this
+	return ms
 }
 
 // End closes any active session on the current goroutine and clears the session binding.
@@ -312,139 +470,47 @@ func (this *MongoTransactionalManager) End() {
 	if this.logger != nil {
 		this.logger.Trace("Ending Transaction", "manager", "MongoTransactionalManager")
 	}
-	goid := routine.Goid()
-	var ms *MongoSession
-	this.mu.Lock()
-	stack := this.sessions[goid]
-	if len(stack) > 0 {
-		ms = stack[len(stack)-1]
-		if len(stack) == 1 {
-			delete(this.sessions, goid)
-		} else {
-			this.sessions[goid] = stack[:len(stack)-1]
-		}
-	}
-	this.mu.Unlock()
-
-	if ms != nil {
+	if ms := this.popSession(); ms != nil {
 		ms.End()
 	}
 }
 
-// Transactional executes action inside a MongoDB transaction, automatically
-// committing on nil Error or rolling back on any returned Error or panic.
-//
-//nolint:contextcheck // Rollback and End use bounded cleanup contexts independent of request cancellation
-func (this *MongoTransactionalManager) Transactional(ctx context.Context, action func(sess *MongoSession) Error) {
-	ms := this.Start(ctx)
-	if ms.Error() != nil {
-		ms.Error().LogError()
+// SetError records an [Error] on the active transaction and triggers rollback via the
+// coordinating [TransactionManager] when active (or directly on the active [MongoSession]).
+func (this *MongoTransactionalManager) SetError(err Error) {
+	if err == nil {
 		return
 	}
-	//nolint:contextcheck // End() uses bounded cleanup context
-	defer this.End()
-
-	var actionErr Error
-	panicked := true
-	defer func() {
-		if panicked {
-			//nolint:errcheck // Best-effort rollback on panic
-			_ = ms.Rollback()
-		}
-	}()
-
-	actionErr = action(ms)
-	panicked = false
-
-	if actionErr != nil {
-		if rollbackErr := ms.Rollback(); rollbackErr != nil {
-			rollbackErr.LogError()
-		}
+	if this.txManager != nil && this.txManager.IsActive() {
+		this.txManager.SetError(err)
 		return
 	}
-
-	if commitErr := ms.Commit(); commitErr != nil {
-		commitErr.LogError()
+	if ms := this.currentSession(); ms != nil && !ms.commitPending {
+		if ms.Error() == nil {
+			ms.SetError(err)
+		}
+		//nolint:errcheck // Primary error is already recorded on the session
+		_ = ms.Rollback()
 	}
 }
 
-// Execute executes action inside a MongoDB transaction, returning the startup, callback, or commit error.
-// If action returns an error and rollback also fails, the original callback error is propagated.
-//
-//nolint:contextcheck // Rollback and End use bounded cleanup contexts independent of request cancellation
-func (this *MongoTransactionalManager) Execute(ctx context.Context, action func(sess *MongoSession) Error) (retErr Error) {
-	ms := this.Start(ctx)
-	if ms.Error() != nil {
+// ReportSessionError records an [Error] against the [MongoSession] bound to a query, dispatching
+// through the session's owning [MongoTransactionalManager] and coordinating [TransactionManager]
+// when the session belongs to that owner's currently active coordinated transaction scope, or
+// rolling back the transactional session directly while preserving commitPending retry recovery.
+func (this *MongoTransactionalManager) ReportSessionError(sess *MongoSession, err Error) {
+	sess.ReportError(err)
+}
+
+// Error returns the [Error] recorded on the coordinating [TransactionManager] or active [MongoSession].
+func (this *MongoTransactionalManager) Error() Error {
+	if this.txManager != nil {
+		if err := this.txManager.Error(); err != nil {
+			return err
+		}
+	}
+	if ms := this.currentSession(); ms != nil {
 		return ms.Error()
 	}
-	//nolint:contextcheck // End() uses bounded cleanup context
-	defer this.End()
-
-	panicked := true
-	defer func() {
-		if panicked {
-			//nolint:errcheck // Best-effort rollback on panic
-			_ = ms.Rollback()
-		}
-		if r := recover(); r != nil {
-			retErr = NewError("TransactionPanicError", fmt.Sprintf("Transaction callback panicked: %v", r))
-		}
-	}()
-
-	actionErr := action(ms)
-	panicked = false
-
-	if actionErr != nil {
-		if rollbackErr := ms.Rollback(); rollbackErr != nil && this.logger != nil {
-			this.logger.Error("Rollback failed after action error", "error", rollbackErr, "actionError", actionErr)
-		}
-		return actionErr
-	}
-
-	return ms.Commit()
-}
-
-// ExecuteWithResult executes action inside a MongoDB transaction and returns the action result along with any error.
-// If action returns an error and rollback also fails, the original callback error is propagated.
-//
-//nolint:contextcheck // Rollback and End use bounded cleanup contexts independent of request cancellation
-func ExecuteWithResult[T any](ctx context.Context, mgr *MongoTransactionalManager, action func(sess *MongoSession) (T, Error)) (_ T, retErr Error) {
-	var zero T
-	if mgr == nil {
-		return zero, NewError("TransactionError", "No transaction manager provided")
-	}
-
-	ms := mgr.Start(ctx)
-	if ms.Error() != nil {
-		return zero, ms.Error()
-	}
-	//nolint:contextcheck // End() uses bounded cleanup context
-	defer mgr.End()
-
-	panicked := true
-	defer func() {
-		if panicked {
-			//nolint:errcheck // Best-effort rollback on panic
-			_ = ms.Rollback()
-		}
-		if r := recover(); r != nil {
-			retErr = NewError("TransactionPanicError", fmt.Sprintf("Transaction callback panicked: %v", r))
-		}
-	}()
-
-	result, actionErr := action(ms)
-	panicked = false
-
-	if actionErr != nil {
-		if rollbackErr := ms.Rollback(); rollbackErr != nil && mgr.logger != nil {
-			mgr.logger.Error("Rollback failed after action error", "error", rollbackErr, "actionError", actionErr)
-		}
-		return zero, actionErr
-	}
-
-	if commitErr := ms.Commit(); commitErr != nil {
-		return zero, commitErr
-	}
-
-	return result, nil
+	return nil
 }

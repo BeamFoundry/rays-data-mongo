@@ -20,6 +20,7 @@ import (
 	. "github.com/BeamFoundry/rays/pkg/core"
 	. "github.com/BeamFoundry/rays/pkg/lang"
 	. "github.com/BeamFoundry/rays/pkg/testing"
+	raystx "github.com/BeamFoundry/rays/pkg/tx"
 )
 
 type customLabeledError struct {
@@ -378,7 +379,10 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		msMock := NewMongoSession(context.Background(), mockSess)
 		Expect(msMock.Commit()).To(HaveOccurred())
 		Expect(mockSess.commitCalls).To(Equal(1))
-		Expect(msMock.Validate()).To(HaveOccurred()) // commitPending is true
+		valErr := msMock.Validate()
+		Expect(valErr).To(HaveOccurred()) // commitPending is true
+		// Reporting a query validation failure while commitPending is true must not cache a terminal error
+		NewMongoTransactionalManager(client, nil).ReportSessionError(msMock, valErr)
 		Expect(msMock.Error()).NotTo(HaveOccurred()) // Not cached, retry allowed
 		Expect(msMock.Rollback()).To(HaveOccurred()) // Cannot rollback with pending commit result
 		mockSess.commitErr = nil
@@ -458,7 +462,8 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		// Session with initial error
 		disClient := &mongo.Client{}
 		disMgr := NewMongoTransactionalManager(disClient, nil)
-		disSess := disMgr.Start(context.Background())
+		Expect(disMgr.Start()).To(HaveOccurred())
+		disSess := disMgr.Get()
 		Expect(disSess.Error()).To(HaveOccurred())
 		Expect(disSess.Validate()).To(HaveOccurred())
 		Expect(disSess.Commit()).To(HaveOccurred())
@@ -466,50 +471,54 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		disMgr.End()
 	})
 
-	It("covers MongoTransactionalManager Start, Get, End, Transactional, Execute, and ExecuteWithResult", func() {
+	It("covers MongoTransactionalManager Start, Commit, Rollback, Get, End, SetError, Error, and TransactionManager coordination", func() {
 		logger := &testTxLogger{}
-		mgr := NewMongoTransactionalManager(client, logger)
+		txManager := raystx.DefaultTransactionManager{}.New()
+		mgr := NewMongoTransactionalManager(client, logger).WithTransactionManager(txManager)
 
-		// 1. Successful Transactional
-		var nilCtx context.Context
-		mgr.Transactional(nilCtx, func(sess *MongoSession) Error {
+		// 1. Coordinated Transactional commit
+		txManager.SetContext(context.Background())
+		Expect(txManager.Transactional(func() Error {
+			sess := mgr.Get()
 			Expect(sess).NotTo(BeNil())
 			Expect(mgr.Get()).To(Equal(sess))
 			coll := client.Database("test_tx_db").Collection("docs")
 			_, err := coll.InsertOne(sess, bson.M{"msg": "success_tx"})
 			Expect(err).NotTo(HaveOccurred())
 			return nil
-		})
+		})).NotTo(HaveOccurred())
+		txManager.ClearContext()
 
-		// 1b. Transactional with early rollback and action error (covers rollbackErr.LogError)
-		mgr.Transactional(context.Background(), func(sess *MongoSession) Error {
-			Expect(sess.Rollback()).NotTo(HaveOccurred())
-			return NewError("ActionError", "failed after rollback")
-		})
-
-		// 1c. Transactional with early rollback and nil error (covers commitErr.LogError)
-		mgr.Transactional(context.Background(), func(sess *MongoSession) Error {
-			Expect(sess.Rollback()).NotTo(HaveOccurred())
-			return nil
-		})
-
-		// 2. Transactional with callback error (rollback)
-		mgr.Transactional(context.Background(), func(sess *MongoSession) Error {
+		// 2. Coordinated Transactional with callback error (rollback)
+		Expect(txManager.Transactional(func() Error {
+			sess := mgr.Get()
 			coll := client.Database("test_tx_db").Collection("docs")
 			_, err := coll.InsertOne(sess, bson.M{"msg": "rollback_tx"})
 			Expect(err).NotTo(HaveOccurred())
 			return NewError("ActionError", "rollback requested")
-		})
+		})).To(HaveOccurred())
 
-		// 3. Transactional with panic (rollback)
-		Expect(func() {
-			mgr.Transactional(context.Background(), func(sess *MongoSession) Error {
-				coll := client.Database("test_tx_db").Collection("docs")
-				_, insertErr := coll.InsertOne(sess, bson.M{"msg": "panic_tx"})
-				Expect(insertErr).NotTo(HaveOccurred())
-				panic("transactional callback panic")
-			})
-		}).To(Panic())
+		// 3. Coordinated Transactional with SetError (immediate rollback)
+		Expect(txManager.Transactional(func() Error {
+			sess := mgr.Get()
+			coll := client.Database("test_tx_db").Collection("docs")
+			_, err := coll.InsertOne(sess, bson.M{"msg": "seterror_tx"})
+			Expect(err).NotTo(HaveOccurred())
+			mgr.SetError(nil) // nil is no-op
+			Expect(mgr.Error()).NotTo(HaveOccurred())
+			mgr.SetError(NewError("RepoError", "repository failure"))
+			Expect(mgr.Error()).To(HaveOccurred())
+			return nil
+		})).To(HaveOccurred())
+
+		// 4. Coordinated Transactional with panic (rollback)
+		Expect(txManager.Transactional(func() Error {
+			sess := mgr.Get()
+			coll := client.Database("test_tx_db").Collection("docs")
+			_, insertErr := coll.InsertOne(sess, bson.M{"msg": "panic_tx"})
+			Expect(insertErr).NotTo(HaveOccurred())
+			panic("transactional callback panic")
+		})).To(HaveOccurred())
 
 		// Verify neither rolled-back doc persisted, and successful doc persisted
 		coll := client.Database("test_tx_db").Collection("docs")
@@ -520,114 +529,122 @@ var _ = Describe("Transaction and ClientBuilder", Ordered, func() {
 		count, countErr := coll.CountDocuments(context.Background(), bson.M{"msg": "rollback_tx"})
 		Expect(countErr).NotTo(HaveOccurred())
 		Expect(count).To(Equal(int64(0)))
+		countSetErr, countSetErrErr := coll.CountDocuments(context.Background(), bson.M{"msg": "seterror_tx"})
+		Expect(countSetErrErr).NotTo(HaveOccurred())
+		Expect(countSetErr).To(Equal(int64(0)))
 		countPanic, countPanicErr := coll.CountDocuments(context.Background(), bson.M{"msg": "panic_tx"})
 		Expect(countPanicErr).NotTo(HaveOccurred())
 		Expect(countPanic).To(Equal(int64(0)))
 
-		// 4. Execute success, error, panic
-		execErr := mgr.Execute(context.Background(), func(_ *MongoSession) Error {
-			return nil
-		})
-		Expect(execErr).NotTo(HaveOccurred())
-
-		execActionErr := mgr.Execute(context.Background(), func(_ *MongoSession) Error {
-			return NewError("ActionError", "execute action error")
-		})
-		Expect(execActionErr).To(HaveOccurred())
-		Expect(execActionErr.Error()).To(ContainSubstring("execute action error"))
-
-		// Execute with early rollback and action error (covers rollback failure logging)
-		exRollbackErr := mgr.Execute(context.Background(), func(sess *MongoSession) Error {
-			Expect(sess.Rollback()).NotTo(HaveOccurred())
-			return NewError("ActionError", "rollback failed")
-		})
-		Expect(exRollbackErr).To(HaveOccurred())
-
-		// Execute with early rollback and nil error (covers commitErr return)
-		exCommitFailErr := mgr.Execute(context.Background(), func(sess *MongoSession) Error {
-			Expect(sess.Rollback()).NotTo(HaveOccurred())
-			return nil
-		})
-		Expect(exCommitFailErr).To(HaveOccurred())
-
-		execPanicErr := mgr.Execute(context.Background(), func(_ *MongoSession) Error {
-			panic("execute panic")
-		})
-		Expect(execPanicErr).To(HaveOccurred())
-		Expect(execPanicErr.Error()).To(ContainSubstring("execute panic"))
-
-		// 5. ExecuteWithResult success, error, panic, nil manager
-		res, resErr := ExecuteWithResult(context.Background(), mgr, func(_ *MongoSession) (string, Error) {
-			return "result_ok", nil
-		})
-		Expect(resErr).NotTo(HaveOccurred())
-		Expect(res).To(Equal("result_ok"))
-
-		_, resActionErr := ExecuteWithResult(context.Background(), mgr, func(_ *MongoSession) (string, Error) {
-			return "", NewError("ActionError", "result action error")
-		})
-		Expect(resActionErr).To(HaveOccurred())
-
-		// ExecuteWithResult with early rollback and action error
-		_, exResRollbackErr := ExecuteWithResult(context.Background(), mgr, func(sess *MongoSession) (int, Error) {
-			Expect(sess.Rollback()).NotTo(HaveOccurred())
-			return 0, NewError("ActionError", "rollback failed")
-		})
-		Expect(exResRollbackErr).To(HaveOccurred())
-
-		// ExecuteWithResult with early rollback and nil error
-		_, exResCommitFailErr := ExecuteWithResult(context.Background(), mgr, func(sess *MongoSession) (int, Error) {
-			Expect(sess.Rollback()).NotTo(HaveOccurred())
-			return 0, nil
-		})
-		Expect(exResCommitFailErr).To(HaveOccurred())
-
-		_, resPanicErr := ExecuteWithResult(context.Background(), mgr, func(_ *MongoSession) (string, Error) {
-			panic("result panic")
-		})
-		Expect(resPanicErr).To(HaveOccurred())
-		Expect(resPanicErr.Error()).To(ContainSubstring("result panic"))
-
-		_, nilMgrErr := ExecuteWithResult[string](context.Background(), nil, func(_ *MongoSession) (string, Error) {
-			return "", nil
-		})
-		Expect(nilMgrErr).To(HaveOccurred())
-
-		// 6. Nested transaction stacking
-		sOuter := mgr.Start(context.Background())
-		Expect(mgr.Get()).To(Equal(sOuter))
-		sInner := mgr.Start(context.Background())
-		Expect(mgr.Get()).To(Equal(sInner))
-		mgr.End()
-		Expect(mgr.Get()).To(Equal(sOuter))
-		mgr.End()
-
-		// 7. Ambient session when no active session
-		ambient := mgr.Get()
-		Expect(ambient.Session()).To(BeNil())
-
-		// 8. Manager without logger
-		mgrNoLogger := NewMongoTransactionalManager(client, nil)
-		mgrNoLogger.End() // empty stack
-		s := mgrNoLogger.Start(context.Background())
-		Expect(s).NotTo(BeNil())
-		mgrNoLogger.End()
-
-		// 9. Startup error propagation for Transactional, Execute, ExecuteWithResult
-		disClient2 := &mongo.Client{}
-		badMgr := NewMongoTransactionalManager(disClient2, nil)
-		badMgr.Transactional(context.Background(), func(_ *MongoSession) Error {
-			Fail("should not run on startup failure")
-			return nil
-		})
-		Expect(badMgr.Execute(context.Background(), func(_ *MongoSession) Error {
-			Fail("should not run on startup failure")
+		// 5. Enlistment failure when txManager already has an error before mgr.Get() is called
+		Expect(txManager.Transactional(func() Error {
+			txManager.SetError(NewError("PreExistingError", "already failed"))
+			sess := mgr.Get()
+			Expect(sess.Error()).To(HaveOccurred())
+			Expect(sess.Error().Name()).To(Equal("PreExistingError"))
 			return nil
 		})).To(HaveOccurred())
-		_, errWithResult := ExecuteWithResult(context.Background(), badMgr, func(_ *MongoSession) (int, Error) {
-			Fail("should not run on startup failure")
-			return 0, nil
-		})
-		Expect(errWithResult).To(HaveOccurred())
+
+		// 6. Enlistment failure when client fails Start() during mgr.Get()
+		disClient := &mongo.Client{}
+		badMgr := NewMongoTransactionalManager(disClient, logger).WithTransactionManager(txManager)
+		Expect(txManager.Transactional(func() Error {
+			sess := badMgr.Get()
+			Expect(sess.Error()).To(HaveOccurred())
+			return nil
+		})).To(HaveOccurred())
+
+		// 7. Standalone manager: Commit/Rollback without active session, SetError/Error, nested stacking, nil logger
+		standalone := NewMongoTransactionalManager(client, nil)
+		Expect(standalone.Commit()).To(HaveOccurred())
+		Expect(standalone.Rollback()).To(HaveOccurred())
+		Expect(mgr.Commit()).To(HaveOccurred())
+		Expect(mgr.Rollback()).To(HaveOccurred())
+		Expect(standalone.Error()).NotTo(HaveOccurred())
+		standalone.SetError(NewError("NoSessErr", "ignored when no session"))
+		standalone.End() // empty stack
+
+		Expect(standalone.Start()).NotTo(HaveOccurred())
+		sOuter := standalone.Get()
+		Expect(sOuter.Session()).NotTo(BeNil())
+		Expect(standalone.Start()).NotTo(HaveOccurred())
+		sInner := standalone.Get()
+		Expect(sInner).NotTo(Equal(sOuter))
+		standalone.SetError(NewError("InnerErr", "inner failed"))
+		Expect(standalone.Error()).To(HaveOccurred())
+		Expect(standalone.Error().Name()).To(Equal("InnerErr"))
+		// Second SetError preserves initial session error
+		standalone.SetError(NewError("SecondErr", "second ignored"))
+		Expect(standalone.Error().Name()).To(Equal("InnerErr"))
+		standalone.End()
+		Expect(standalone.Get()).To(Equal(sOuter))
+		Expect(standalone.Commit()).NotTo(HaveOccurred())
+		standalone.End()
+
+		// 8. SetError when txManager is configured but has no active transaction records error on current session and rolls it back
+		Expect(mgr.Start()).NotTo(HaveOccurred())
+		sInactiveCoord := mgr.Get()
+		Expect(sInactiveCoord.Session()).NotTo(BeNil())
+		mgr.SetError(NewError("LocalSessionErr", "coordinator inactive"))
+		Expect(txManager.Error()).NotTo(HaveOccurred())
+		Expect(mgr.Error()).To(HaveOccurred())
+		Expect(mgr.Error().Name()).To(Equal("LocalSessionErr"))
+		Expect(sInactiveCoord.Validate()).To(HaveOccurred())
+		mgr.End()
+
+		// 9. Ambient session when no active session
+		ambient := mgr.Get()
+		Expect(ambient.Session()).To(BeNil())
+		Expect(mgr.Error()).NotTo(HaveOccurred())
+
+		// 10. ReportSessionError: nil/ambient no-ops, coordinated scope forwarding, and captured outer session isolation from nested transactions
+		ambientSess := mgr.Get()
+		mgr.ReportSessionError(nil, NewError("IgnoredErr", "nil session"))
+		mgr.ReportSessionError(ambientSess, nil)
+		mgr.ReportSessionError(ambientSess, NewError("IgnoredErr", "ambient session"))
+		Expect(ambientSess.Error()).NotTo(HaveOccurred())
+
+		// Coordinated transaction: ReportSessionError in original scope forwards to txManager,
+		// while a retained ambient query cannot mark or roll back the coordinated transaction.
+		Expect(txManager.Transactional(func() Error {
+			mgr.ReportSessionError(ambientSess, NewError("RetainedAmbientErr", "must not affect active tx"))
+			Expect(txManager.Error()).NotTo(HaveOccurred())
+
+			coordSess := mgr.Get()
+			mgr.ReportSessionError(coordSess, NewError("CoordQueryErr", "fails original scope"))
+			Expect(txManager.Error()).To(HaveOccurred())
+			Expect(txManager.Error().Name()).To(Equal("CoordQueryErr"))
+			return nil
+		})).To(HaveOccurred())
+
+		// Nested transaction: ReportSessionError on outer session rolls back outer session without rolling back inner session or active coordinator
+		Expect(mgr.Start()).NotTo(HaveOccurred())
+		outerCap := mgr.Get()
+		Expect(mgr.Start()).NotTo(HaveOccurred())
+		innerCap := mgr.Get()
+		mgr.ReportSessionError(outerCap, NewError("OuterQueryErr", "outer query failed while inner active"))
+		mgr.ReportSessionError(outerCap, NewError("SecondOuterErr", "preserves first outer error"))
+		Expect(outerCap.Error()).To(HaveOccurred())
+		Expect(outerCap.Error().Name()).To(Equal("OuterQueryErr"))
+		Expect(outerCap.Validate()).To(HaveOccurred())
+		Expect(innerCap.Error()).NotTo(HaveOccurred())
+		Expect(innerCap.Validate()).NotTo(HaveOccurred())
+		Expect(mgr.Commit()).NotTo(HaveOccurred())
+		mgr.End()
+		Expect(mgr.Commit()).To(HaveOccurred())
+		mgr.End()
+
+		// 11. New(), WithDatabase(), Database(), and resolvedClient() fallbacks (database client and nil client)
+		dbBackedMgr := MongoTransactionalManager{}.New().WithDatabase(client.Database("test_tx_db"))
+		Expect(dbBackedMgr.Database()).NotTo(BeNil())
+		Expect(dbBackedMgr.Database().Name()).To(Equal("test_tx_db"))
+		Expect(dbBackedMgr.Start()).NotTo(HaveOccurred())
+		Expect(dbBackedMgr.Get().Session()).NotTo(BeNil())
+		dbBackedMgr.End()
+
+		nilClientMgr := dbBackedMgr.WithDatabase(nil)
+		Expect(nilClientMgr.Database()).To(BeNil())
+		Expect(nilClientMgr.Start()).To(HaveOccurred())
+		nilClientMgr.End()
 	})
 })

@@ -37,6 +37,7 @@ type MongoQuery struct {
 	validator      interface{ Validate() Error }
 	err            Error
 	hint           any
+	onError        func(context.Context, Error)
 	collation      *options.Collation
 	maxTime        *time.Duration
 	skip           *int64
@@ -48,6 +49,18 @@ type MongoQuery struct {
 	sort           bson.D
 	projection     bson.D
 	extraFindOpts  []*options.FindOptions
+}
+
+func extractSession(ctx context.Context) *tx.MongoSession {
+	if s, ok := ctx.(*tx.MongoSession); ok {
+		return s
+	}
+	if ctx != nil {
+		if s, ok := ctx.Value((*tx.MongoSession)(nil)).(*tx.MongoSession); ok {
+			return s
+		}
+	}
+	return nil
 }
 
 func extractValidator(ctx context.Context) interface{ Validate() Error } {
@@ -133,6 +146,9 @@ func (this *MongoQuery) Scopes(funcs ...MongoQueryFunc) *MongoQuery {
 }
 
 // WithContext returns a copy of the query using the provided [context.Context].
+// If ctx is (or wraps) a [*tx.MongoSession], session validation and terminal error
+// reporting are rebound to that session; if ctx does not carry a [*tx.MongoSession],
+// terminal error reporting is detached from the previously captured session.
 func (this *MongoQuery) WithContext(ctx context.Context) *MongoQuery {
 	q := this.clone()
 	if ctx != nil {
@@ -455,6 +471,19 @@ func (this *MongoQuery) findOneOptions() *options.FindOneOptions {
 	return opt
 }
 
+func (this *MongoQuery) withErrorReporter(fn func(context.Context, Error)) *MongoQuery {
+	q := this.clone()
+	q.onError = fn
+	return q
+}
+
+func (this *MongoQuery) reportError(err Error) Error {
+	if this != nil && this.onError != nil {
+		this.onError(this.ctx, err)
+	}
+	return err
+}
+
 func (this *MongoQuery) validateExecution() (*mongo.Collection, Error) {
 	if this == nil {
 		return nil, NewError("IllegalArgumentError", "Query cannot be nil")
@@ -482,15 +511,15 @@ func (this *MongoQuery) validateExecution() (*mongo.Collection, Error) {
 func (this *MongoQuery) Find(dest any) Error {
 	coll, err := this.validateExecution()
 	if err != nil {
-		return err
+		return this.reportError(err)
 	}
 	if dest == nil {
-		return NewError("IllegalArgumentError", "Destination cannot be nil")
+		return this.reportError(NewError("IllegalArgumentError", "Destination cannot be nil"))
 	}
 
 	destVal := reflect.ValueOf(dest)
 	if destVal.Kind() != reflect.Pointer || destVal.Elem().Kind() != reflect.Slice {
-		return NewError("IllegalArgumentError", "Destination must be a pointer to a slice")
+		return this.reportError(NewError("IllegalArgumentError", "Destination must be a pointer to a slice"))
 	}
 
 	// Enforce explicit Limit(0) by returning an empty slice without querying unbounded documents.
@@ -501,14 +530,14 @@ func (this *MongoQuery) Find(dest any) Error {
 
 	cursor, driverErr := coll.Find(this.ctx, this.Filter(), this.FindOptions()...)
 	if driverErr != nil {
-		return NewWrappedError("MongoError", driverErr)
+		return this.reportError(NewWrappedError("MongoError", driverErr))
 	}
 	defer func() {
 		_ = cursor.Close(this.ctx)
 	}()
 
 	if driverErr := cursor.All(this.ctx, dest); driverErr != nil {
-		return NewWrappedError("MongoError", driverErr)
+		return this.reportError(NewWrappedError("MongoError", driverErr))
 	}
 	return nil
 }
@@ -517,21 +546,21 @@ func (this *MongoQuery) Find(dest any) Error {
 func (this *MongoQuery) First(dest any) Error {
 	coll, err := this.validateExecution()
 	if err != nil {
-		return err
+		return this.reportError(err)
 	}
 	if dest == nil {
-		return NewError("IllegalArgumentError", "Destination cannot be nil")
+		return this.reportError(NewError("IllegalArgumentError", "Destination cannot be nil"))
 	}
 	if this.limit != nil && *this.limit == 0 {
-		return NewWrappedError("NotFoundError", mongo.ErrNoDocuments)
+		return this.reportError(NewWrappedError("NotFoundError", mongo.ErrNoDocuments))
 	}
 
 	res := coll.FindOne(this.ctx, this.Filter(), this.findOneOptions())
 	if decodeErr := res.Decode(dest); decodeErr != nil {
 		if errors.Is(decodeErr, mongo.ErrNoDocuments) {
-			return NewWrappedError("NotFoundError", decodeErr)
+			return this.reportError(NewWrappedError("NotFoundError", decodeErr))
 		}
-		return NewWrappedError("MongoError", decodeErr)
+		return this.reportError(NewWrappedError("MongoError", decodeErr))
 	}
 	return nil
 }
@@ -540,7 +569,7 @@ func (this *MongoQuery) First(dest any) Error {
 func (this *MongoQuery) Count() (int64, Error) {
 	coll, err := this.validateExecution()
 	if err != nil {
-		return 0, err
+		return 0, this.reportError(err)
 	}
 	if this.limit != nil && *this.limit == 0 {
 		return 0, nil
@@ -565,7 +594,7 @@ func (this *MongoQuery) Count() (int64, Error) {
 
 	count, driverErr := coll.CountDocuments(this.ctx, this.Filter(), countOpts)
 	if driverErr != nil {
-		return 0, NewWrappedError("MongoError", driverErr)
+		return 0, this.reportError(NewWrappedError("MongoError", driverErr))
 	}
 	return count, nil
 }
@@ -574,7 +603,7 @@ func (this *MongoQuery) Count() (int64, Error) {
 func (this *MongoQuery) Exists() (bool, Error) {
 	coll, err := this.validateExecution()
 	if err != nil {
-		return false, err
+		return false, this.reportError(err)
 	}
 	if this.limit != nil && *this.limit == 0 {
 		return false, nil
@@ -596,7 +625,7 @@ func (this *MongoQuery) Exists() (bool, Error) {
 
 	count, driverErr := coll.CountDocuments(this.ctx, this.Filter(), countOpts)
 	if driverErr != nil {
-		return false, NewWrappedError("MongoError", driverErr)
+		return false, this.reportError(NewWrappedError("MongoError", driverErr))
 	}
 	return count > 0, nil
 }
@@ -605,7 +634,7 @@ func (this *MongoQuery) Exists() (bool, Error) {
 func (this *MongoQuery) Delete() (int64, Error) {
 	coll, err := this.validateExecution()
 	if err != nil {
-		return 0, err
+		return 0, this.reportError(err)
 	}
 	delOpts := options.Delete()
 	if this.hint != nil {
@@ -617,7 +646,7 @@ func (this *MongoQuery) Delete() (int64, Error) {
 
 	res, driverErr := coll.DeleteMany(this.ctx, this.Filter(), delOpts)
 	if driverErr != nil {
-		return 0, NewWrappedError("MongoError", driverErr)
+		return 0, this.reportError(NewWrappedError("MongoError", driverErr))
 	}
 	return res.DeletedCount, nil
 }
@@ -626,15 +655,15 @@ func (this *MongoQuery) Delete() (int64, Error) {
 func (this *MongoQuery) Distinct(fieldName string, dest any) Error {
 	coll, err := this.validateExecution()
 	if err != nil {
-		return err
+		return this.reportError(err)
 	}
 	if dest == nil {
-		return NewError("IllegalArgumentError", "Destination cannot be nil")
+		return this.reportError(NewError("IllegalArgumentError", "Destination cannot be nil"))
 	}
 
 	destVal := reflect.ValueOf(dest)
 	if destVal.Kind() != reflect.Pointer || destVal.Elem().Kind() != reflect.Slice {
-		return NewError("IllegalArgumentError", "Destination must be a pointer to a slice")
+		return this.reportError(NewError("IllegalArgumentError", "Destination must be a pointer to a slice"))
 	}
 
 	distinctOpts := options.Distinct()
@@ -647,7 +676,7 @@ func (this *MongoQuery) Distinct(fieldName string, dest any) Error {
 
 	vals, driverErr := coll.Distinct(this.ctx, fieldName, this.Filter(), distinctOpts)
 	if driverErr != nil {
-		return NewWrappedError("MongoError", driverErr)
+		return this.reportError(NewWrappedError("MongoError", driverErr))
 	}
 
 	elemType := destVal.Elem().Type().Elem()
@@ -655,7 +684,7 @@ func (this *MongoQuery) Distinct(fieldName string, dest any) Error {
 	for _, rawVal := range vals {
 		converted, convErr := convertDistinctValue(rawVal, elemType)
 		if convErr != nil {
-			return convErr
+			return this.reportError(convErr)
 		}
 		sliceVal = reflect.Append(sliceVal, converted)
 	}
@@ -667,15 +696,15 @@ func (this *MongoQuery) Distinct(fieldName string, dest any) Error {
 func (this *MongoQuery) Aggregate(pipeline, dest any) Error {
 	coll, err := this.validateExecution()
 	if err != nil {
-		return err
+		return this.reportError(err)
 	}
 	if dest == nil {
-		return NewError("IllegalArgumentError", "Destination cannot be nil")
+		return this.reportError(NewError("IllegalArgumentError", "Destination cannot be nil"))
 	}
 
 	destVal := reflect.ValueOf(dest)
 	if destVal.Kind() != reflect.Pointer || destVal.Elem().Kind() != reflect.Slice {
-		return NewError("IllegalArgumentError", "Destination must be a pointer to a slice")
+		return this.reportError(NewError("IllegalArgumentError", "Destination must be a pointer to a slice"))
 	}
 
 	aggOpts := options.Aggregate()
@@ -691,14 +720,14 @@ func (this *MongoQuery) Aggregate(pipeline, dest any) Error {
 
 	cursor, driverErr := coll.Aggregate(this.ctx, pipeline, aggOpts)
 	if driverErr != nil {
-		return NewWrappedError("MongoError", driverErr)
+		return this.reportError(NewWrappedError("MongoError", driverErr))
 	}
 	defer func() {
 		_ = cursor.Close(this.ctx)
 	}()
 
 	if driverErr := cursor.All(this.ctx, dest); driverErr != nil {
-		return NewWrappedError("MongoError", driverErr)
+		return this.reportError(NewWrappedError("MongoError", driverErr))
 	}
 	return nil
 }

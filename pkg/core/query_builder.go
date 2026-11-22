@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding"
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
@@ -496,8 +497,7 @@ func collapseAnd(group bson.A) any {
 }
 
 func (this *mongoCompiledQuery[T, ID]) Query(
-	db *mongo.Database,
-	tx MongoTransactional,
+	txAndDBProvider func() (MongoTransactional, *mongo.Database),
 	collectionName string,
 ) func(in []reflect.Value) []reflect.Value {
 	output := this.function.Type.Out(0)
@@ -520,7 +520,9 @@ func (this *mongoCompiledQuery[T, ID]) Query(
 	}
 
 	return func(in []reflect.Value) []reflect.Value {
-		q := NewMongoQuery(tx.Get(), db, collectionName)
+		tx, db := txAndDBProvider()
+		ctx, recordErr := newQueryErrorReporter(tx)
+		q := NewMongoQuery(ctx, db, collectionName)
 
 		filter, index := this.buildFilter(in)
 		if filter != nil {
@@ -541,18 +543,23 @@ func (this *mongoCompiledQuery[T, ID]) Query(
 		}
 
 		if output == reflect.TypeFor[*MongoQuery]() {
+			q = q.withErrorReporter(recordErr)
+			recordErr(q.ctx, q.Error())
 			return formatResult(reflect.ValueOf(q), q.Error())
 		}
 
 		switch this.kind {
 		case queryKindCount:
 			count, err := q.Count()
+			recordErr(q.ctx, err)
 			return formatResult(reflect.ValueOf(count), err)
 		case queryKindExists:
 			exists, err := q.Exists()
+			recordErr(q.ctx, err)
 			return formatResult(reflect.ValueOf(exists), err)
 		case queryKindDelete:
 			deleted, err := q.Delete()
+			recordErr(q.ctx, err)
 			if errorOnly {
 				if err != nil {
 					return []reflect.Value{reflect.ValueOf(err)}
@@ -562,6 +569,9 @@ func (this *mongoCompiledQuery[T, ID]) Query(
 			return formatResult(reflect.ValueOf(deleted), err)
 		default:
 			val, err := this.executeFind(q, multi, stream, optional)
+			if err != nil && (hasError || !errors.Is(err, mongo.ErrNoDocuments)) {
+				recordErr(q.ctx, err)
+			}
 			return formatResult(val, err)
 		}
 	}
