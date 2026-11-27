@@ -3,7 +3,7 @@ module github.com/BeamFoundry/rays-data-mongo
 go 1.27.2
 
 require (
-	github.com/BeamFoundry/rays v0.5.0-rc2
+	github.com/BeamFoundry/rays v0.5.0-rc3
 	github.com/onsi/ginkgo/v2 v2.34.0
 	github.com/onsi/gomega v1.44.0
 	github.com/testcontainers/testcontainers-go v0.45.0
