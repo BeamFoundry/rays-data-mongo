@@ -64,7 +64,7 @@ rays:
   data:
     mongo:
       otel:
-        commandAttributeDisabled: false
+        commandAttributeDisabled: true
 ```
 
 ### Customizing Options (`MongoOtelCustomizer`)

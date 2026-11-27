@@ -25,7 +25,7 @@ type MongoOtelCustomizer interface {
 }
 
 type mongoOtelConfig struct {
-	commandAttributeDisabled bool
+	commandAttributeDisabled *bool
 }
 
 // MongoOtelConfiguration provides the default OpenTelemetry [*event.CommandMonitor]
@@ -57,9 +57,11 @@ func (this *MongoOtelConfiguration) CommandMonitor(
 	if tp, ok := this.tracerProvider.Get(); ok {
 		opts = append(opts, otelmongo.WithTracerProvider(tp))
 	}
-	if cfg.commandAttributeDisabled {
-		opts = append(opts, otelmongo.WithCommandAttributeDisabled(true))
+	commandAttrDisabled := true
+	if cfg.commandAttributeDisabled != nil {
+		commandAttrDisabled = *cfg.commandAttributeDisabled
 	}
+	opts = append(opts, otelmongo.WithCommandAttributeDisabled(commandAttrDisabled))
 	for _, customizer := range this.customizers {
 		opts = customizer.CustomizeMongoOtel(opts)
 	}

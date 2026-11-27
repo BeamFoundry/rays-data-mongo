@@ -67,11 +67,7 @@ var _ = Describe("MongoOtelConfiguration", func() {
 		})
 	}
 
-	It("provides a CommandMonitor configured with TracerProvider, options, customizers, and ClientOptionsCustomizer", func() {
-		Expect(GetContainer().LoadConfigAt(map[string]any{
-			"commandAttributeDisabled": true,
-		}, "rays.data.mongo.otel")).NotTo(HaveOccurred())
-
+	It("provides a CommandMonitor defaulting to commandAttributeDisabled=true and supports customizers and ClientOptionsCustomizer", func() {
 		sr := tracetest.NewSpanRecorder()
 		tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 		recordedTP = tp
@@ -101,8 +97,40 @@ var _ = Describe("MongoOtelConfiguration", func() {
 		spans := sr.Ended()
 		Expect(spans).To(HaveLen(1))
 		for _, attr := range spans[0].Attributes() {
-			Expect(string(attr.Key)).NotTo(Equal("db.statement"))
+			Expect(string(attr.Key)).NotTo(BeElementOf("db.statement", "db.query.text"))
 		}
+	})
+
+	It("passes explicit commandAttributeDisabled=false to otelmongo", func() {
+		Expect(GetContainer().LoadConfigAt(map[string]any{
+			"commandAttributeDisabled": false,
+		}, "rays.data.mongo.otel")).NotTo(HaveOccurred())
+
+		sr := tracetest.NewSpanRecorder()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+		recordedTP = tp
+		DeferCleanup(func() {
+			recordedTP = nil
+			Expect(tp.Shutdown(context.Background())).To(Succeed())
+		})
+
+		AddBeamFor(&testTPConfig{})
+		GetContainer().EnableScanning()
+		Expect(GetContainer().Initialize()).To(Succeed())
+
+		monitor := GetBeamScopedInstance[*event.CommandMonitor]()
+		emitCommand(monitor, 2)
+		Expect(tp.ForceFlush(context.Background())).To(Succeed())
+
+		spans := sr.Ended()
+		Expect(spans).To(HaveLen(1))
+		var hasCommandAttr bool
+		for _, attr := range spans[0].Attributes() {
+			if attr.Key == "db.statement" || attr.Key == "db.query.text" {
+				hasCommandAttr = true
+			}
+		}
+		Expect(hasCommandAttr).To(BeTrue())
 	})
 
 	It("surfaces non-KeyNotFoundError from rays.data.mongo.otel config", func() {
